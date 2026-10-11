@@ -152,6 +152,10 @@ public class VkRenderCore {
             Logger.warn("Voxy VK: no frame command buffer at hook point, skipping frame");
             return;
         }
+        if (!adapter.isRecordingOutsideRenderPass()) {
+            Logger.warn("Voxy VK: cannot render frame while RenderPass is active");
+            return;
+        }
         var crs = Minecraft.getInstance().gameRenderer.gameRenderState().levelRenderState.cameraRenderState;
         if (crs == null || !crs.initialized) return;
 

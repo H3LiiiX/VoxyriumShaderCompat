@@ -31,8 +31,13 @@ public final class MinecraftVkHostAdapter implements IVkHost {
     @Override
     public VkCommandBuffer frameCommandBuffer() {
         //MC's persistent per-frame encoder; the command buffer it is currently
-        // recording into (null outside a render pass)
+        // recording into
         var encoder = (AccessorVulkanCommandEncoder) (Object) this.device.createCommandEncoder();
         return encoder.voxy$currentCommandBuffer();
+    }
+
+    public boolean isRecordingOutsideRenderPass() {
+        var encoder = (AccessorVulkanCommandEncoder) (Object) this.device.createCommandEncoder();
+        return encoder.voxy$currentCommandBuffer() != null && encoder.voxy$currentRenderPass() == null;
     }
 }

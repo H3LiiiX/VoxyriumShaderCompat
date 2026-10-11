@@ -16,35 +16,29 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-//The pure-Vulkan render entry point.
+//The pure-Vulkan render capture entry point.
 //
-//NOTE: the earlier hook on the TAIL of vanilla ChunkSectionsToRender.renderGroup
-// NEVER fired, because Sodium 0.9.1 — which renders terrain on MC's Vulkan
-// device too — injects at the HEAD of renderGroup and calls
-// CallbackInfo.cancel(), so the vanilla RETURN (and every @At("TAIL") injector)
-// is bypassed. Sodium instead draws through SodiumWorldRenderer#drawChunkLayer.
-// We therefore trigger Voxy's frame at the TAIL of drawChunkLayer for the
-// OPAQUE group: Sodium's opaque terrain has just been drawn, its render pass
-// is closed, the frame command buffer is recording, and MC's depth buffer
-// holds vanilla terrain — exactly the state Voxy's VK frame needs.
+//Captures frame matrices and camera coordinates at the TAIL of Sodium's OPAQUE
+// drawChunkLayer. Sodium's opaque terrain has just been recorded into MC's RenderPass.
+// Execution of the pure-Vulkan LOD frame is deferred until the RenderPass closes,
+// so Voxy's dynamic rendering and barriers are never recorded inside an active pass.
 @Mixin(value = SodiumWorldRenderer.class, remap = false)
 public class MixinSodiumOpaqueVkFrame {
 
     @Inject(method = "drawChunkLayer", at = @At("TAIL"), remap = false)
-    private void voxy$renderVkFrame(RenderPass pass, ChunkSectionLayerGroup group, ChunkRenderMatrices matrices,
-                                    double x, double y, double z, GpuSampler sampler, OitStage stage, CallbackInfo ci) {
+    private void voxy$captureVkFrame(RenderPass pass, ChunkSectionLayerGroup group, ChunkRenderMatrices matrices,
+                                     double x, double y, double z, GpuSampler sampler, OitStage stage, CallbackInfo ci) {
         if (group != ChunkSectionLayerGroup.OPAQUE) return;
-        if (!(MinecraftVkHost.get() instanceof MinecraftVkHostAdapter adapter)) return;
+        if (!(MinecraftVkHost.get() instanceof MinecraftVkHostAdapter)) return;
 
         var renderer = IVoxyRenderSystemHolder.getNullable();
         if (renderer == null || renderer.vkCore == null) return;
 
         try {
             var target = DefaultTerrainRenderPasses.CUTOUT.getTarget();
-            renderer.vkCore.renderFrame(target, adapter, matrices, x, y, z);
+            me.cortex.voxy.client.core.vk.VkFrameCapture.capture(target, matrices, x, y, z);
         } catch (Throwable t) {
-            //Never take down MC's frame; log loudly instead
-            Logger.error("Voxy VK frame failed", t);
+            Logger.error("Voxy VK frame capture failed", t);
         }
     }
 }

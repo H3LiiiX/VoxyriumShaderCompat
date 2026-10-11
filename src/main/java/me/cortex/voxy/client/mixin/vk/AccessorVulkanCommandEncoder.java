@@ -13,4 +13,7 @@ import org.spongepowered.asm.mixin.gen.Accessor;
 public interface AccessorVulkanCommandEncoder {
     @Accessor("currentCommandBuffer")
     VkCommandBuffer voxy$currentCommandBuffer();
+
+    @Accessor("currentRenderPass")
+    Object voxy$currentRenderPass();
 }

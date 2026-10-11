@@ -39,10 +39,57 @@ public abstract class MixinLevelRenderer implements IVoxyRenderSystemHolder {
     @Override
     public void voxy$shutdownRenderer() {
         VoxyBlaze3DProbeRenderer.shutdown();
+        me.cortex.voxy.client.core.vk.VkFrameCapture.reset();
         if (this.renderer != null) {
             this.renderer.shutdown();
             this.renderer = null;
         }
+    }
+
+    @Inject(method = "executeSolid", at = @At("TAIL"))
+    private void voxy$afterExecuteSolid(net.minecraft.client.renderer.chunk.ChunkSectionsToRender chunks,
+                                        net.minecraft.client.renderer.feature.FeatureRenderDispatcher.PreparedFrame features,
+                                        com.mojang.renderpearl.api.commands.RenderPass renderPass,
+                                        CallbackInfo ci) {
+        me.cortex.voxy.client.core.vk.VkFrameCapture.tryRenderPendingVkFrame();
+    }
+
+    @Inject(
+        method = "lambda$addMainPass$0",
+        at = @At(
+            value = "INVOKE",
+            target = "Lcom/mojang/renderpearl/api/commands/RenderPass;close()V",
+            shift = At.Shift.AFTER,
+            ordinal = 0
+        ),
+        require = 0
+    )
+    private void voxy$afterMainPassClose(com.mojang.renderpearl.api.buffers.GpuBufferSlice fog,
+                                         boolean oit,
+                                         net.minecraft.client.renderer.chunk.ChunkSectionsToRender chunks,
+                                         net.minecraft.client.renderer.feature.FeatureRenderDispatcher.PreparedFrame features,
+                                         boolean gizmos,
+                                         boolean outline,
+                                         CallbackInfo ci) {
+        me.cortex.voxy.client.core.vk.VkFrameCapture.tryRenderPendingVkFrame();
+    }
+
+    @Inject(
+        method = "lambda$addMainPass$0",
+        at = @At(
+            value = "INVOKE",
+            target = "Lnet/minecraft/client/renderer/LevelRenderer;executeOutline(Lnet/minecraft/client/renderer/feature/FeatureRenderDispatcher$PreparedFrame;)V"
+        ),
+        require = 0
+    )
+    private void voxy$beforeExecuteOutline(com.mojang.renderpearl.api.buffers.GpuBufferSlice fog,
+                                           boolean oit,
+                                           net.minecraft.client.renderer.chunk.ChunkSectionsToRender chunks,
+                                           net.minecraft.client.renderer.feature.FeatureRenderDispatcher.PreparedFrame features,
+                                           boolean gizmos,
+                                           boolean outline,
+                                           CallbackInfo ci) {
+        me.cortex.voxy.client.core.vk.VkFrameCapture.tryRenderPendingVkFrame();
     }
 
     /*
