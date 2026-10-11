@@ -10,7 +10,7 @@ public class MixinConfig implements IMixinConfigPlugin {
     private final Set<String> fallThrough;
 
     public MixinConfig() {
-        this.fallThrough = Set.of();
+        this.fallThrough = Set.of("vk");
     }
 
     @Override
