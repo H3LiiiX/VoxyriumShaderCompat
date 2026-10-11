@@ -85,4 +85,48 @@ public final class VkFrameHost {
             vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, null, null, imb);
         }
     }
+
+    public static void barrierColorAttachment(VkCommandBuffer cmd, GpuTextureView view) {
+        try (MemoryStack stack = stackPush()) {
+            long image = ((VulkanGpuTexture) view.texture()).vkImage();
+            var imb = VkImageMemoryBarrier.calloc(1, stack).sType$Default()
+                    .srcAccessMask(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+                    .dstAccessMask(VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+                    .oldLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                    .newLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .image(image);
+            imb.subresourceRange()
+                    .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .levelCount(VK_REMAINING_MIP_LEVELS)
+                    .layerCount(VK_REMAINING_ARRAY_LAYERS);
+            vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    0, null, null, imb);
+        }
+    }
+
+    public static void barrierDepthAttachment(VkCommandBuffer cmd, GpuTextureView view) {
+        try (MemoryStack stack = stackPush()) {
+            long image = ((VulkanGpuTexture) view.texture()).vkImage();
+            var imb = VkImageMemoryBarrier.calloc(1, stack).sType$Default()
+                    .srcAccessMask(VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
+                    .dstAccessMask(VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT)
+                    .oldLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                    .newLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .image(image);
+            imb.subresourceRange()
+                    .aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                    .levelCount(VK_REMAINING_MIP_LEVELS)
+                    .layerCount(VK_REMAINING_ARRAY_LAYERS);
+            vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+                    0, null, null, imb);
+        }
+    }
 }

@@ -21,3 +21,4 @@ public class MixinVitrailEngineStages {
         VkFrameCapture.tryRenderPendingVkFrame();
     }
 }
+

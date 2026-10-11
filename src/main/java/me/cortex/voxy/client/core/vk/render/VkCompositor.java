@@ -1,6 +1,7 @@
 package me.cortex.voxy.client.core.vk.render;
 
 import com.mojang.renderpearl.api.textures.GpuTextureView;
+import me.cortex.voxy.client.compat.vitrail.VitrailVkCompat;
 import me.cortex.voxy.client.core.RenderProperties;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.vk.VkBuffer;
@@ -47,8 +48,10 @@ public class VkCompositor {
 
     private VkShaderPipeline depthSetup;
     private VkShaderPipeline composite;
+    private VkShaderPipeline compositeColortex0;
     private int setupDepthFormat = -1;
     private int compositeColorFormat = -1, compositeDepthFormat = -1;
+    private int colortex0ColorFormat = -1, colortex0DepthFormat = -1;
 
     //Reused each frame for the composite-param matrices (no per-frame allocation)
     private final Matrix4f scratchA = new Matrix4f();
@@ -96,6 +99,7 @@ public class VkCompositor {
         d.vertGlsl = VkShaderSource.load("voxy:post/fullscreen2.vert", VkShaderSource.defs().props(this.properties).build());
         d.fragGlsl = VkShaderSource.load("voxy:post/blit_texture_depth_cutout.frag", VkShaderSource.defs().props(this.properties)
                 .def("EMIT_COLOUR")
+                .defIf("HAS_FOG", this.useEnvFog)
                 .defIf("USE_ENV_FOG", this.useEnvFog)
                 .build());
         d.colorFormat = mcColorFormat;
@@ -110,6 +114,29 @@ public class VkCompositor {
         this.composite = new VkShaderPipeline(this.ctx, d);
         this.compositeColorFormat = mcColorFormat;
         this.compositeDepthFormat = mcDepthFormat;
+    }
+
+    private void ensureCompositeColortex0Pipeline(int colorFormat, int depthFormat) {
+        if (this.compositeColortex0 != null && this.colortex0ColorFormat == colorFormat && this.colortex0DepthFormat == depthFormat) return;
+        if (this.compositeColortex0 != null) this.compositeColortex0.free();
+        var d = new VkShaderPipeline.GfxDesc();
+        d.name = "composite-colortex0";
+        d.vertGlsl = VkShaderSource.load("voxy:post/fullscreen2.vert", VkShaderSource.defs().props(this.properties).build());
+        d.fragGlsl = VkShaderSource.load("voxy:post/blit_texture_depth_cutout.frag", VkShaderSource.defs().props(this.properties)
+                .def("EMIT_COLOUR")
+                .build());
+        d.colorFormat = colorFormat;
+        d.depthFormat = depthFormat;
+        d.stencilFormat = VK_FORMAT_UNDEFINED;
+        d.depthTest = true;
+        d.depthWrite = false;
+        d.depthCompare = VkCmd.closerEqual(this.properties);
+        d.blend = true;
+        d.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+        d.bindings = List.of(VkShaderPipeline.sampler(0), VkShaderPipeline.ubo(1), VkShaderPipeline.sampler(3));
+        this.compositeColortex0 = new VkShaderPipeline(this.ctx, d);
+        this.colortex0ColorFormat = colorFormat;
+        this.colortex0DepthFormat = depthFormat;
     }
 
     /** Wrapper carrying the per-frame MC attachment info alongside Voxy's viewport. */
@@ -286,11 +313,55 @@ public class VkCompositor {
         }
         vkCmdDraw(cmd, 4, 1, 0, 0);
         vkCmdEndRenderingKHR(cmd);
+
+        GpuTextureView colortex0 = VitrailVkCompat.getColortex0();
+        if (colortex0 != null) {
+            int colortex0Format = VkFrameHost.vkFormat(colortex0);
+            this.ensureCompositeColortex0Pipeline(colortex0Format, mcDepthFormat);
+
+            VkFrameHost.barrierDepthAttachment(cmd, rt.mcDepth);
+            VkFrameHost.barrierColorAttachment(cmd, colortex0);
+
+            int width = colortex0.getWidth(0);
+            int height = colortex0.getHeight(0);
+
+            try (MemoryStack stack = stackPush()) {
+                var colorAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
+                        .imageView(VkFrameHost.vkView(colortex0))
+                        .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                        .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
+                        .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+                var depthAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
+                        .imageView(VkFrameHost.vkView(rt.mcDepth))
+                        .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                        .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
+                        .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+                var info = VkRenderingInfoKHR.calloc(stack).sType$Default()
+                        .renderArea(VkRect2D.calloc(stack).extent(e -> e.width(width).height(height)))
+                        .layerCount(1)
+                        .pColorAttachments(colorAttach)
+                        .pDepthAttachment(depthAttach);
+                vkCmdBeginRenderingKHR(cmd, info);
+            }
+            this.compositeColortex0.bind(cmd);
+            VkCmd.setViewportScissor(cmd, width, height);
+            try (var b = this.compositeColortex0.binder()) {
+                b.sampler(0, viewport.depthSampleView, this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                        .ubo(1, this.compositeParams)
+                        .sampler(3, viewport.colourSSAO.view, this.colourSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                        .push(cmd);
+            }
+            vkCmdDraw(cmd, 4, 1, 0, 0);
+            vkCmdEndRenderingKHR(cmd);
+
+            VkFrameHost.barrierColorAttachment(cmd, colortex0);
+        }
     }
 
     public void free() {
         if (this.depthSetup != null) this.depthSetup.free();
         if (this.composite != null) this.composite.free();
+        if (this.compositeColortex0 != null) this.compositeColortex0.free();
         //depthSampler/colourSampler come from VkImage2D.createSampler's
         // device-lifetime cache (shared across compositor/SSAO/terrain); never
         // destroy them per-object (double vkDestroySampler -> SIGSEGV on unload)
