@@ -1,13 +1,16 @@
 package me.cortex.voxy.client.mixin.vk;
 
-import com.mojang.blaze3d.textures.GpuSampler;
+import com.mojang.renderpearl.api.commands.RenderPass;
+import com.mojang.renderpearl.api.textures.GpuSampler;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.client.core.vk.MinecraftVkHost;
 import me.cortex.voxy.client.core.vk.MinecraftVkHostAdapter;
 import me.cortex.voxy.common.Logger;
 import net.caffeinemc.mods.sodium.client.render.SodiumWorldRenderer;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
+import net.caffeinemc.mods.sodium.client.render.chunk.terrain.DefaultTerrainRenderPasses;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayerGroup;
+import net.minecraft.client.renderer.oit.OitStage;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -28,8 +31,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public class MixinSodiumOpaqueVkFrame {
 
     @Inject(method = "drawChunkLayer", at = @At("TAIL"), remap = false)
-    private void voxy$renderVkFrame(ChunkSectionLayerGroup group, ChunkRenderMatrices matrices,
-                                    double x, double y, double z, GpuSampler sampler, CallbackInfo ci) {
+    private void voxy$renderVkFrame(RenderPass pass, ChunkSectionLayerGroup group, ChunkRenderMatrices matrices,
+                                    double x, double y, double z, GpuSampler sampler, OitStage stage, CallbackInfo ci) {
         if (group != ChunkSectionLayerGroup.OPAQUE) return;
         if (!(MinecraftVkHost.get() instanceof MinecraftVkHostAdapter adapter)) return;
 
@@ -37,7 +40,8 @@ public class MixinSodiumOpaqueVkFrame {
         if (renderer == null || renderer.vkCore == null) return;
 
         try {
-            renderer.vkCore.renderFrame(group.outputTarget(), adapter, matrices, x, y, z);
+            var target = DefaultTerrainRenderPasses.CUTOUT.getTarget();
+            renderer.vkCore.renderFrame(target, adapter, matrices, x, y, z);
         } catch (Throwable t) {
             //Never take down MC's frame; log loudly instead
             Logger.error("Voxy VK frame failed", t);

@@ -1,17 +1,21 @@
 package me.cortex.voxy.client.core.backend.blaze3d;
 
-import com.mojang.blaze3d.GpuFormat;
-import com.mojang.blaze3d.PrimitiveTopology;
-import com.mojang.blaze3d.pipeline.ColorTargetState;
-import com.mojang.blaze3d.pipeline.RenderPipeline;
-import com.mojang.blaze3d.systems.DeviceInfo;
-import com.mojang.blaze3d.systems.GpuDeviceBackend;
-import com.mojang.blaze3d.systems.RenderPass;
-import com.mojang.blaze3d.systems.RenderPassBackend;
-import com.mojang.blaze3d.systems.RenderPassDescriptor;
-import com.mojang.blaze3d.textures.GpuTexture;
-import com.mojang.blaze3d.textures.GpuTextureView;
+import com.mojang.renderpearl.api.GpuFormat;
+import com.mojang.renderpearl.api.pipeline.ColorTargetState;
+import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
+import com.mojang.renderpearl.api.pipeline.RenderPipeline;
+import com.mojang.renderpearl.api.device.DeviceInfo;
+import com.mojang.renderpearl.backend.api.BackendRenderPipeline;
+import com.mojang.renderpearl.backend.api.GpuDeviceBackend;
+import com.mojang.renderpearl.backend.api.RenderPassBackend;
+import com.mojang.renderpearl.api.commands.RenderPass;
+import com.mojang.renderpearl.api.commands.RenderPassDescriptor;
+import com.mojang.renderpearl.api.textures.GpuTexture;
+import com.mojang.renderpearl.api.textures.GpuTextureView;
+import com.mojang.renderpearl.frontend.FrontendRenderPass;
+import com.mojang.renderpearl.frontend.FrontendRenderPipeline;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
+import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
 import net.minecraft.resources.Identifier;
 import java.lang.reflect.Proxy;
 import java.util.List;
@@ -29,14 +33,14 @@ public final class Blaze3dPipelineTargetsTest {
                 || !variants.sampleMask().getShaderDefines().flags().contains("VOXY_SAMPLE_MASK_DISCARD")
                 || variants.normal().getLocation().equals(variants.sampleMask().getLocation())
                 || !variants.normal().getDepthStencilState().equals(variants.sampleMask().getDepthStencilState())
-                || !variants.normal().getColorTargetState().equals(variants.sampleMask().getColorTargetState())) {
+                || !variants.normal().getColorTargetStates().equals(variants.sampleMask().getColorTargetStates())) {
             throw new AssertionError("Discard variants must have independent shader defines/IDs and identical attachment state");
         }
         verify(Blaze3dAuxiliaryPipelines.HIZ_COPY, GpuFormat.R32_FLOAT);
         verify(Blaze3dAuxiliaryPipelines.HIZ_REDUCE, GpuFormat.R32_FLOAT);
         verify(Blaze3dAuxiliaryPipelines.HIZ_VISIBILITY, GpuFormat.R8_UNORM);
         verify(Blaze3dAuxiliaryPipelines.HIZ_COMMANDS, GpuFormat.RGBA32_UINT);
-        if (Blaze3dAuxiliaryPipelines.SODIUM_DEPTH.getColorTargetState().writeMask() != ColorTargetState.WRITE_NONE
+        if (Blaze3dAuxiliaryPipelines.SODIUM_DEPTH.getColorTargetStates().get(0).writeMask() != ColorTargetState.WRITE_NONE
                 || !Blaze3dAuxiliaryPipelines.SODIUM_DEPTH.wantsDepthTexture()) {
             throw new AssertionError("Depth prefill must write depth without writing colour");
         }
@@ -71,7 +75,7 @@ public final class Blaze3dPipelineTargetsTest {
     }
 
     private static void verify(RenderPipeline pipeline, GpuFormat format) {
-        DeviceInfo info = new DeviceInfo("Headless test", "", "", true, "Test", 1,
+        DeviceInfo info = new DeviceInfo("Headless test", "", "", true, "Test", 1.0f,
                 null, null, Set.of(), null, null);
         GpuDeviceBackend device = (GpuDeviceBackend) Proxy.newProxyInstance(GpuDeviceBackend.class.getClassLoader(),
                 new Class<?>[]{GpuDeviceBackend.class}, (proxy, method, args) -> {
@@ -84,18 +88,36 @@ public final class Blaze3dPipelineTargetsTest {
                     if (method.getName().equals("close")) return null;
                     throw new AssertionError("Unexpected render backend call: " + method);
                 });
-        GpuTexture texture = new GpuTexture(GpuTexture.USAGE_RENDER_ATTACHMENT, "Headless target", format, 4, 4, 1, 1) {
-            public void close() {}
-            public boolean isClosed() { return false; }
-        };
-        GpuTextureView view = new GpuTextureView(texture, 0, 1) {
-            public void close() {}
-            public boolean isClosed() { return false; }
-        };
-        try (RenderPass pass = new RenderPass(backend, device,
-                List.of(new RenderPassDescriptor.Attachment<>(view, Optional.empty())), () -> {},
+        BackendRenderPipeline backendPipeline = (BackendRenderPipeline) Proxy.newProxyInstance(BackendRenderPipeline.class.getClassLoader(),
+                new Class<?>[]{BackendRenderPipeline.class}, (proxy, method, args) -> null);
+        FrontendRenderPipeline compiled = new FrontendRenderPipeline(
+                pipeline.getLocation().toString(),
+                backendPipeline,
+                pipeline.getVertexFormatBindings(),
+                new Object2IntOpenHashMap<>(),
+                List.of(),
+                pipeline.getColorTargetStates(),
+                pipeline.wantsDepthTexture(),
+                pipeline.pushConstantSize()
+        );
+        GpuTexture texture = (GpuTexture) Proxy.newProxyInstance(GpuTexture.class.getClassLoader(),
+                new Class<?>[]{GpuTexture.class}, (proxy, method, args) -> {
+                    if (method.getName().equals("getFormat")) return format;
+                    if (method.getName().equals("isClosed")) return false;
+                    if (method.getName().equals("close")) return null;
+                    throw new AssertionError("Unexpected texture call: " + method);
+                });
+        GpuTextureView view = (GpuTextureView) Proxy.newProxyInstance(GpuTextureView.class.getClassLoader(),
+                new Class<?>[]{GpuTextureView.class}, (proxy, method, args) -> {
+                    if (method.getName().equals("texture")) return texture;
+                    if (method.getName().equals("isClosed")) return false;
+                    if (method.getName().equals("close")) return null;
+                    throw new AssertionError("Unexpected texture view call: " + method);
+                });
+        try (RenderPass pass = new FrontendRenderPass(backend, device,
+                List.of(new RenderPassDescriptor.Attachment<>(view, Optional.empty())), false, () -> {},
                 new RenderPass.RenderArea(0, 0, 4, 4))) {
-            pass.setPipeline(pipeline);
+            pass.setPipeline(compiled);
         }
     }
 }

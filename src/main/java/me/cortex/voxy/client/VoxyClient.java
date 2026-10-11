@@ -1,6 +1,6 @@
 package me.cortex.voxy.client;
 
-import com.mojang.blaze3d.systems.GpuDevice;
+import com.mojang.renderpearl.api.device.GpuDevice;
 import me.cortex.voxy.client.compat.IrisBackendCompat;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;

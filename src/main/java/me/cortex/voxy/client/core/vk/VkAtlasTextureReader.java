@@ -1,7 +1,7 @@
 package me.cortex.voxy.client.core.vk;
 
-import com.mojang.blaze3d.textures.GpuTexture;
-import com.mojang.blaze3d.vulkan.VulkanGpuTexture;
+import com.mojang.renderpearl.api.textures.GpuTexture;
+import com.mojang.renderpearl.backend.vulkan.VulkanGpuTexture;
 import me.cortex.voxy.client.core.model.bakery.IAtlasTextureReader;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;

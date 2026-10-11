@@ -1,7 +1,7 @@
 package me.cortex.voxy.client.core;
 
-import com.mojang.blaze3d.opengl.GlConst;
-import com.mojang.blaze3d.opengl.GlStateManager;
+import com.mojang.renderpearl.backend.opengl.GlConst;
+import com.mojang.renderpearl.backend.opengl.GlStateManager;
 import me.cortex.voxy.client.TimingStatistics;
 import me.cortex.voxy.client.VoxyClient;
 import me.cortex.voxy.client.config.VoxyConfig;
@@ -224,7 +224,15 @@ public class VoxyRenderSystem {
         }
 
         //cameraY += 100;
-        var voxyProjection = computeProjectionMat(this.properties, vanillaProjection);
+        float farPlaneChunks = 3000;
+        //dont like this hacky instanceof thing and how this is wired
+        //TODO: fixme
+        if (this.pipeline instanceof IrisVoxyRenderPipeline ivrp) {
+            if (ivrp._getData().useDynamicFarPlane) {
+                farPlaneChunks = (VoxyConfig.CONFIG.sectionRenderDistance * 32 + 2) * ((float) Math.sqrt(3));
+            }
+        }
+        var voxyProjection = computeProjectionMat(this.properties, vanillaProjection, farPlaneChunks*16);
 
         /*
         int[] dims = new int[4];
@@ -489,6 +497,10 @@ public class VoxyRenderSystem {
     }*/
 
     public static Matrix4f computeProjectionMat(RenderProperties properties, Matrix4fc base) {
+        return computeProjectionMat(properties, base, 16 * 3000);
+    }
+
+    public static Matrix4f computeProjectionMat(RenderProperties properties, Matrix4fc base, float farPlane) {
 
         //this jank is to capture the extra crap they inject like viewbobbing
         var rawMCProj = Minecraft.getInstance().gameRenderer.gameRenderState().levelRenderState.cameraRenderState.projectionMatrix;
@@ -497,7 +509,7 @@ public class VoxyRenderSystem {
         float near = getVanillaRenderDistance()<=32.0f?8f:16f;
         near = VoxyClient.disableSodiumChunkRender()?0.1f:near;
 
-        float far = 16*3000;
+        float far = farPlane;
 
         /* jank way of just modifying the base raw
         if (true) {

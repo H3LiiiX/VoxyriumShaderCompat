@@ -1,6 +1,6 @@
 package me.cortex.voxy.client.core.backend;
 
-import com.mojang.blaze3d.systems.GpuDevice;
+import com.mojang.renderpearl.api.device.GpuDevice;
 
 import java.util.Locale;
 
