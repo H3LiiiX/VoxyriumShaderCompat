@@ -1,6 +1,7 @@
 package me.cortex.voxy.client.mixin.vk;
 
 import com.mojang.renderpearl.backend.vulkan.VulkanCommandEncoder;
+import com.mojang.renderpearl.backend.vulkan.VulkanRenderPass;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.gen.Accessor;
@@ -15,5 +16,5 @@ public interface AccessorVulkanCommandEncoder {
     VkCommandBuffer voxy$currentCommandBuffer();
 
     @Accessor("currentRenderPass")
-    Object voxy$currentRenderPass();
+    VulkanRenderPass voxy$currentRenderPass();
 }
