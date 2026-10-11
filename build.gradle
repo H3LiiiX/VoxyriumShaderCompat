@@ -370,18 +370,12 @@ jar {
     }
 }
 
-project.ext.lwjglVersion = "3.4.1"
+project.ext.lwjglVersion = "3.4.3"
 
-// --- Voxy Vulkan backend deps (optional at runtime; probed via capability detection) ---
+// --- Voxy Vulkan backend deps (provided by Minecraft 26.3 runtime; do not bundle to avoid JiJ classpath conflicts) ---
 dependencies {
-    include(implementation("org.lwjgl:lwjgl-vulkan:${project.ext.lwjglVersion}"))
-    include(implementation("org.lwjgl:lwjgl-shaderc:${project.ext.lwjglVersion}"))
-    for (n in ["natives-windows", "natives-linux", "natives-macos", "natives-macos-arm64"]) {
-        include(runtimeOnly("org.lwjgl:lwjgl-shaderc:${project.ext.lwjglVersion}:${n}"))
-    }
-    // MoltenVK translation layer path on macOS is provided by lwjgl-vulkan natives there:
-    include(runtimeOnly("org.lwjgl:lwjgl-vulkan:${project.ext.lwjglVersion}:natives-macos"))
-    include(runtimeOnly("org.lwjgl:lwjgl-vulkan:${project.ext.lwjglVersion}:natives-macos-arm64"))
+    compileOnly("org.lwjgl:lwjgl-vulkan:${project.ext.lwjglVersion}")
+    compileOnly("org.lwjgl:lwjgl-shaderc:${project.ext.lwjglVersion}")
 }
 project.ext.lwjglNatives = "natives-windows"
 
