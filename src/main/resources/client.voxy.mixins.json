@@ -41,7 +41,8 @@
     "sodium.MixinVisibleChunkCollector",
     "vk.AccessorVulkanCommandEncoder",
     "vk.MixinSodiumOpaqueVkFrame",
-    "vk.MixinVulkanDevice"
+    "vk.MixinVulkanDevice",
+    "vitrail.MixinVitrailEngineStages"
   ],
   "injectors": {
     "defaultRequire": 1
