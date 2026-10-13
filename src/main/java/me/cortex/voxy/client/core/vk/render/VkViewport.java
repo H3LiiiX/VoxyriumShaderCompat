@@ -37,9 +37,15 @@ public class VkViewport extends Viewport<VkViewport> {
     // compositor samples it — mirroring the GL colourTex/colourSSAOTex pair.
     public VkImage2D colourSSAO;
     //Shaderpack LOD programs: colour is then the pack-lit (HDR) colortex0 the pack writes, and these
-    // hold its other opaque draw buffers (colortex6 for Complementary), composited into the pack's
-    // own targets. Empty outside that mode.
+    // hold its other opaque draw buffers (colortex6 for Complementary, all of them for a pack that
+    // writes no colortex0), in output order with the colour left out, composited into the pack's own
+    // targets. Empty outside that mode.
     public VkImage2D[] packData = new VkImage2D[0];
+    //...and one per output of the pack's translucent program, drawn after its deferred stage
+    public VkImage2D[] packTrans = new VkImage2D[0];
+    //...and where the translucent program drew at all (alpha 1), which is what is composited
+    public VkImage2D packTransMeta;
+    private PackLayout packLayout;
     //...and the opaque depth in the window depth the pack reads (its vxDepthTexOpaque), null outside that mode
     public VkImage2D packDepth;
     //...and the face / AO flag of every opaque LOD pixel, for Voxy's SSAO (see ssao.comp PACK_AO)
@@ -69,27 +75,31 @@ public class VkViewport extends Viewport<VkViewport> {
         return false;
     }
 
-    public static final int PACK_COLOUR_FORMAT = VK_FORMAT_R16G16B16A16_SFLOAT;
-    public static final int PACK_DATA_FORMAT = VK_FORMAT_R16G16B16A16_SFLOAT;
+    public static final int PACK_COLOUR_FORMAT = PackLayout.COLOUR_FORMAT;
 
     public boolean isPackMode() {
         return this.packMode;
     }
 
+    /** The layout the pack-mode targets were made for, null outside that mode. */
+    public PackLayout packLayout() {
+        return this.packLayout;
+    }
+
     /**
      * (Re)creates the offscreen targets on size or mode change; true if recreated.
-     * @param packDataTargets -1 outside shaderpack LOD mode, else how many extra opaque draw buffers it writes
+     * @param layout null outside shaderpack LOD mode, else the outputs of the pack's LOD programs
      */
-    public boolean ensureTargets(int packDataTargets) {
+    public boolean ensureTargets(PackLayout layout) {
         if (this.width <= 0 || this.height <= 0) return false;
-        boolean packMode = packDataTargets >= 0;
-        int dataCount = Math.max(0, packDataTargets);
+        boolean packMode = layout != null;
         if (this.colour != null && this.colour.width == this.width && this.colour.height == this.height
-                && this.packMode == packMode && this.packData.length == dataCount) return false;
+                && this.packMode == packMode && java.util.Objects.equals(this.packLayout, layout)) return false;
         if (this.colour != null) {
             this.freeTargets();//destruction is deferred until the frames using them retire
         }
         this.packMode = packMode;
+        this.packLayout = layout;
         this.colour = new VkImage2D(this.ctx, this.width, this.height, 1,
                 packMode ? PACK_COLOUR_FORMAT : VK_FORMAT_R8G8B8A8_UNORM,
                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
@@ -103,12 +113,20 @@ public class VkViewport extends Viewport<VkViewport> {
         this.packLight = packMode ? new VkImage2D(this.ctx, this.width, this.height, 1, PACK_LIGHT_FORMAT,
                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                 VK_IMAGE_ASPECT_COLOR_BIT, false) : null;
-        this.packData = new VkImage2D[dataCount];
-        for (int i = 0; i < dataCount; i++) {
-            this.packData[i] = new VkImage2D(this.ctx, this.width, this.height, 1, PACK_DATA_FORMAT,
-                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    VK_IMAGE_ASPECT_COLOR_BIT, false);
+        var data = new java.util.ArrayList<VkImage2D>();
+        var trans = new java.util.ArrayList<VkImage2D>();
+        if (packMode) {
+            for (int i = 0; i < layout.opaqueCount(); i++) {
+                if (i == layout.colourOutput()) continue;//that one is `colour`
+                data.add(this.packImage(layout.opaqueFormats()[i]));
+            }
+            for (int i = 0; i < layout.translucentCount(); i++) {
+                trans.add(this.packImage(layout.translucentFormats()[i]));
+            }
         }
+        this.packData = data.toArray(new VkImage2D[0]);
+        this.packTrans = trans.toArray(new VkImage2D[0]);
+        this.packTransMeta = packMode ? this.packImage(PACK_META_FORMAT) : null;
         this.colourSSAO = new VkImage2D(this.ctx, this.width, this.height, 1,
                 packMode ? PACK_COLOUR_FORMAT : VK_FORMAT_R8G8B8A8_UNORM,
                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
@@ -132,6 +150,23 @@ public class VkViewport extends Viewport<VkViewport> {
         return true;
     }
 
+    private VkImage2D packImage(int format) {
+        return new VkImage2D(this.ctx, this.width, this.height, 1, format,
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT, false);
+    }
+
+    /** The image each output of the pack's opaque program is rasterised into, in output order. */
+    public VkImage2D[] packOpaqueOutputs() {
+        var layout = this.packLayout;
+        var out = new VkImage2D[layout.opaqueCount()];
+        int data = 0;
+        for (int i = 0; i < out.length; i++) {
+            out[i] = i == layout.colourOutput() ? this.colour : this.packData[data++];
+        }
+        return out;
+    }
+
     private void freeTargets() {
         this.colour.free();
         this.colourSSAO.free();
@@ -141,6 +176,14 @@ public class VkViewport extends Viewport<VkViewport> {
             data.free();
         }
         this.packData = new VkImage2D[0];
+        for (var trans : this.packTrans) {
+            trans.free();
+        }
+        this.packTrans = new VkImage2D[0];
+        if (this.packTransMeta != null) {
+            this.packTransMeta.free();
+            this.packTransMeta = null;
+        }
         if (this.packDepth != null) {
             this.packDepth.free();
             this.packDepth = null;

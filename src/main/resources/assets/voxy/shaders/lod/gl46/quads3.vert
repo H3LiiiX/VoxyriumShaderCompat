@@ -59,6 +59,21 @@ layout(location = 3) out flat vec2 voxyPlane;//lod scale, the face plane's offse
 
 vec2 taaShift();
 
+//The translucent quads of a section are one draw with no face culling, emitted in the order the mesher
+// finishes merging them. A translucent block's rear faces then showed through its front ones wherever
+// the rear quad came first (ice over water: the ice's underside under its top, a second layer of ice,
+// in rectangles the shape of the merged quads), which the game itself culls. Fluids keep theirs (the
+// game draws a water surface from below too), and so do the models that need both sides (crossed ones)
+bool isRearFacingTranslucent(const in QuadData quad, uint modelId) {
+    BlockModel model = modelData[modelId];
+    if (!modelIsTranslucent(model) || modelIsFluid(model) || (model.flagsA & 32u) != 0u) {
+        return false;
+    }
+    float plane = quad.axis == 0u ? quad.basePoint.y : (quad.axis == 1u ? quad.basePoint.z : quad.basePoint.x);
+    float camera = quad.axis == 0u ? cameraSubPos.y : (quad.axis == 1u ? cameraSubPos.z : cameraSubPos.x);
+    return (quad.face & 1u) == 1u ? camera < plane : camera > plane;
+}
+
 //TODO: add a mechanism so that some quads can ignore backface culling
 // this would help alot with stuff like crops as they would look kinda weird i think,
 // same with flowers etc
@@ -67,9 +82,15 @@ void main() {
 
     QuadData quad;
     uvec2 pos = positionBuffer[BASE_INSTANCE];
-    setupQuad(quad, quadData[uint(VERT_ID)>>2], pos, (VERT_ID&3) == 1);
+    Quad rawQuad = quadData[uint(VERT_ID)>>2];
+    setupQuad(quad, rawQuad, pos, (VERT_ID&3) == 1);
 
     uint cornerId = VERT_ID&3;
+
+    vec4 cornerPos = getQuadCornerPos(quad, cornerId);
+    if (isRearFacingTranslucent(quad, extractStateId(rawQuad))) {
+        cornerPos = vec4(2.0, 2.0, 2.0, 1.0);//every corner on one point outside the view: nothing drawn
+    }
 
     gl_Position =
     #ifdef USE_NV_JANK
@@ -77,7 +98,7 @@ void main() {
     f16vec4
     #endif
     #endif
-    (getQuadCornerPos(quad, cornerId));
+    (cornerPos);
 
 
     #ifndef USE_NV_BARRY

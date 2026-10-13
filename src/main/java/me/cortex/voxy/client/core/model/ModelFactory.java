@@ -549,8 +549,10 @@ public class ModelFactory {
 
             metadata |= canBeOccluded?4:0;
 
-            //Face uses its own lighting if its not flat against the adjacent block & isnt traslucent
-            metadata |= (offset > 0.01 || layer == ChunkSectionLayer.TRANSLUCENT)?0b1000:0;
+            //Face uses its own lighting if its not flat against the adjacent block. A translucent block's
+            // flat faces take the light of the block they face too, as the game lights them: ice dims the
+            // sky light by a level, so lit from within its top was a level darker than the real ice's
+            metadata |= (offset > 0.01)?0b1000:0;
 
 
 

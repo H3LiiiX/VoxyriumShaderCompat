@@ -60,7 +60,8 @@ public final class VitrailVoxyPack {
     private static Loaded loaded;
 
     private record Loaded(Object chain, VoxyPackPatch patch, Object block, Object sink, long[] cursor,
-                          Object gbufferStep, Object waterStep, java.util.Set<Integer> written, Object values, Object targets) {}
+                          Object gbufferStep, Object waterStep, java.util.Set<Integer> written, Object values, Object targets,
+                          boolean complementaryFog) {}
 
     //Whether the LOD translucents are being drawn, which happens after the pack's deferred stage, where
     // the real water is: the targets they read and write are then on the halves the water's are
@@ -260,15 +261,27 @@ public final class VitrailVoxyPack {
             }
 
             String jsonText = liveText(expand(source, settings, json));
-            String opaqueText = opaque == null ? null : header + String.join("\n", lines(expand(source, settings, opaque)));
-            String translucentText = translucent == null ? null : header + String.join("\n", lines(expand(source, settings, translucent)));
+            Object opaqueUnit = opaque == null ? null : expand(source, settings, opaque);
+            Object translucentUnit = translucent == null ? null : expand(source, settings, translucent);
+            String opaqueText = opaqueUnit == null ? null : header + String.join("\n", lines(opaqueUnit));
+            String translucentText = translucentUnit == null ? null : header + String.join("\n", lines(translucentUnit));
+            //What the programs declare for themselves, in the code that is compiled
+            Map<String, String> ownDeclared = new java.util.LinkedHashMap<>();
+            collectOwnDeclared(opaqueUnit, ownDeclared);
+            collectOwnDeclared(translucentUnit, ownDeclared);
 
             //The pack declares a uniform's type where its other programs read it (lib/uniforms.glsl in
             // Complementary); the engine's own shape for the name stands in where it declares none
             Map<String, String> types = new HashMap<>();
+            //Complementary, whose border fog Voxy draws over the LODs for it (its fog code is the one
+            // VitrailVkCompat patches); told apart by the file that fog lives in
+            boolean complementaryFog = false;
             @SuppressWarnings("unchecked")
             List<Path> files = (List<Path>) sourceFiles.invoke(source);
             for (Path file : files) {
+                if (file.toString().replace('\\', '/').endsWith("lib/atmospherics/fog/mainFog.glsl")) {
+                    complementaryFog = true;
+                }
                 @SuppressWarnings("unchecked")
                 List<String> fileLines = (List<String>) sourceReadLines.invoke(source, file);
                 for (String line : fileLines) {
@@ -277,15 +290,31 @@ public final class VitrailVoxyPack {
             }
             Object catalog = valuesCatalog.invoke(values);
             Map<String, String> withEngine = new HashMap<>(types);
+            Map<String, String> listTypes = null;
             for (String name : jsonUniformNames(jsonText)) {
                 if (!withEngine.containsKey(name)) {
                     Object shape = catalogNatural.invoke(catalog, name);
                     String glsl = shape == null ? null : glslType(shape.toString());
+                    if (glsl == null) {
+                        //Last, a declaration in a list (uniform float a, b;), which is how BSL and Solas
+                        // declare most of theirs
+                        if (listTypes == null) {
+                            listTypes = new HashMap<>();
+                            for (Path file : files) {
+                                @SuppressWarnings("unchecked")
+                                List<String> fileLines = (List<String>) sourceReadLines.invoke(source, file);
+                                for (String line : fileLines) {
+                                    VoxyPackPatch.collectUniformListTypes(line, listTypes);
+                                }
+                            }
+                        }
+                        glsl = listTypes.get(name);
+                    }
                     if (glsl != null) withEngine.put(name, glsl);
                 }
             }
 
-            VoxyPackPatch patch = VoxyPackPatch.parse(jsonText, opaqueText, translucentText, withEngine);
+            VoxyPackPatch patch = VoxyPackPatch.parse(jsonText, opaqueText, translucentText, withEngine, ownDeclared);
 
             List<Object> members = new ArrayList<>();
             for (var e : patch.packUniformTypes().entrySet()) {
@@ -315,8 +344,37 @@ public final class VitrailVoxyPack {
             Logger.info("Loaded the shaderpack's Voxy LOD programs (" + (prefix.isEmpty() ? "root" : place) + ", "
                     + patch.packUniformTypes().size() + " uniforms, " + patch.samplers().size() + " samplers"
                     + (patch.hasTranslucent() ? ", with translucents)" : ")"));
-            return new Loaded(chain, patch, block, sink, cursor, step, waterStep(targets), writtenTargets(targets), values, targets);
+            return new Loaded(chain, patch, block, sink, cursor, step, waterStep(targets), writtenTargets(targets), values, targets,
+                    complementaryFog);
         }
+    }
+
+    private static void collectOwnDeclared(Object unit, Map<String, String> into) throws Throwable {
+        if (unit == null) return;
+        List<String> unitLines = lines(unit);
+        for (int i = 0; i < unitLines.size(); i++) {
+            if ((boolean) unitIsLive.invoke(unit, i)) {
+                VoxyPackPatch.collectOwnUniform(unitLines.get(i), into);
+            }
+        }
+    }
+
+    /**
+     * Whether a program of the active pack writes {@code colortex<index>}. A buffer none of them writes
+     * is only read by the pack's Voxy branches, which Vitrail builds out. True when it cannot be told.
+     */
+    public static boolean isWritten(int index) {
+        Loaded l = loaded;
+        return l == null || l.written == null || l.written.contains(index);
+    }
+
+    /**
+     * Whether the pack whose LOD programs are loaded is Complementary, whose border fog (its BORDER_FOG
+     * setting) Voxy draws over the LODs for it. Null when no LOD programs are loaded.
+     */
+    public static Boolean loadedHasComplementaryFog() {
+        Loaded l = loaded;
+        return l == null ? null : l.complementaryFog;
     }
 
     private static Path find(Object source, String... candidates) throws Throwable {
@@ -493,6 +551,29 @@ public final class VitrailVoxyPack {
         if (l == null) return null;
         try {
             return target(l, index, true);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static Method targetsCoverage;
+    private static boolean coverageReflected;
+
+    /**
+     * Vitrail's coverage mask (R32F): the depth the pack's own geometry left at every pixel it drew.
+     * Vitrail's scene seed paints the game's own picture into the terrain's first draw buffer wherever
+     * the world's depth is in front of the mask, so a pixel the mask does not claim is painted over.
+     * Null when Vitrail has none (or no longer has this method).
+     */
+    public static GpuTextureView coverage() {
+        Loaded l = loaded;
+        if (l == null) return null;
+        try {
+            if (!coverageReflected) {
+                coverageReflected = true;
+                targetsCoverage = method(Class.forName("dev.vitrail.render.ColorTargets"), "coverage");
+            }
+            return targetsCoverage == null ? null : (GpuTextureView) targetsCoverage.invoke(l.targets);
         } catch (Throwable t) {
             return null;
         }

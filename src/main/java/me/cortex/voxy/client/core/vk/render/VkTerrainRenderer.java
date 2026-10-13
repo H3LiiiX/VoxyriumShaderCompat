@@ -273,18 +273,19 @@ public class VkTerrainRenderer {
      * Returns false (and leaves pack mode) when there is no patch or it cannot be built, in which case
      * the LODs are drawn with Voxy's own vanilla-lit shaders.
      */
-    public boolean preparePack(VoxyPackPatch patch, int depthFormat) {
-        if (patch == null) {
+    public boolean preparePack(VoxyPackPatch patch, PackLayout layout, int depthFormat) {
+        if (patch == null || layout == null) {
             this.freePack();
             return false;
         }
-        if (patch == this.pack && this.packOpaque != null && depthFormat == this.packDepthFormat) {
+        if (patch == this.pack && this.packOpaque != null && depthFormat == this.packDepthFormat && layout.equals(this.packLayout)) {
             return true;
         }
         this.freePack();
         try {
-            this.buildPack(patch, depthFormat);
+            this.buildPack(patch, layout, depthFormat);
             this.pack = patch;
+            this.packLayout = layout;
             this.packDepthFormat = depthFormat;
             this.packHasPrev = false;
             return true;
@@ -295,7 +296,9 @@ public class VkTerrainRenderer {
         }
     }
 
-    private void buildPack(VoxyPackPatch patch, int depthFormat) {
+    private PackLayout packLayout;
+
+    private void buildPack(VoxyPackPatch patch, PackLayout layout, int depthFormat) {
         {
             var d = new VkShaderPipeline.GfxDesc();
             d.name = "pack-depth";
@@ -342,21 +345,18 @@ public class VkTerrainRenderer {
             this.packLightPrepass = new VkShaderPipeline(this.ctx, d);
         }
 
-        int[] dataTargets = patch.opaqueDataTargets();
-        int[] opaqueFormats = new int[2 + dataTargets.length];
-        opaqueFormats[0] = VkViewport.PACK_COLOUR_FORMAT;
-        for (int i = 0; i < dataTargets.length; i++) {
-            opaqueFormats[1 + i] = VkViewport.PACK_DATA_FORMAT;
-        }
-        //After the pack's draw buffers: the face / AO flag for Voxy's SSAO
-        opaqueFormats[1 + dataTargets.length] = VkViewport.PACK_META_FORMAT;
+        int opaqueCount = layout.opaqueCount();
+        int[] opaqueFormats = new int[opaqueCount + 1];
+        System.arraycopy(layout.opaqueFormats(), 0, opaqueFormats, 0, opaqueCount);
+        //After the pack's draw buffers: the face / AO flag for Voxy's SSAO (also where an LOD was drawn)
+        opaqueFormats[opaqueCount] = VkViewport.PACK_META_FORMAT;
 
         {
             String frag = VkShaderSource.load("voxy:lod/gl46/quads.frag", VkShaderSource.defs().props(this.properties)
                     .defIf("VOXY_VULKAN_SAMPLE_MASK_DISCARD", this.ctx.vk().needsSampleMaskDiscard)
                     .def("PATCHED_SHADER")
                     .def("VOXY_SMOOTH_LIGHT")
-                    .def("VOXY_PACK_AO_LOCATION", 1 + dataTargets.length)
+                    .def("VOXY_PACK_AO_LOCATION", opaqueCount)
                     .build()) + patch.opaqueFragmentTail();
             var spirv = ShadercCompiler.compile(frag, ShaderType.FRAGMENT, "terrain-pack-opaque.frag");
             this.packOpaqueSamplers = usedSamplers(patch, spirv);
@@ -380,24 +380,30 @@ public class VkTerrainRenderer {
         }
 
         if (patch.hasTranslucent()) {
+            int translucentCount = layout.translucentCount();
             String frag = VkShaderSource.load("voxy:lod/gl46/quads.frag", VkShaderSource.defs().props(this.properties)
                     .defIf("VOXY_VULKAN_SAMPLE_MASK_DISCARD", this.ctx.vk().needsSampleMaskDiscard)
                     .def("PATCHED_SHADER")
                     .def("TRANSLUCENT")
                     .def("PACK_ANIMATED_WATER")
                     .def("VOXY_TRANSLUCENT_AFTER_DEFERRED")//drawn by renderDeferredTranslucent
+                    //After the pack's draw buffers: where the translucent program drew, for the composite
+                    .def("VOXY_PACK_AO_LOCATION", translucentCount)
                     .build()) + patch.translucentFragmentTail();
             var spirv = ShadercCompiler.compile(frag, ShaderType.FRAGMENT, "terrain-pack-translucent.frag");
             this.packTranslucentSamplers = usedSamplers(patch, spirv);
 
-            var blend = patch.translucentBlend();
+            int[] formats = new int[translucentCount + 1];
+            System.arraycopy(layout.translucentFormats(), 0, formats, 0, translucentCount);
+            formats[translucentCount] = VkViewport.PACK_META_FORMAT;
+            int[][] blends = new int[translucentCount + 1][];
+            System.arraycopy(layout.translucentBlends(), 0, blends, 0, translucentCount);
             var d = new VkShaderPipeline.GfxDesc();
             d.name = "terrain-pack-translucent";
             d.vertGlsl = vert;
             d.fragSpirv = spirv;
-            d.colorFormats = new int[]{VkViewport.PACK_COLOUR_FORMAT};
-            d.attachmentBlend = new int[][]{blend == null ? null
-                    : new int[]{blend.srcColor(), blend.dstColor(), blend.srcAlpha(), blend.dstAlpha()}};
+            d.colorFormats = formats;
+            d.attachmentBlend = blends;
             d.depthFormat = depthFormat;
             d.stencilFormat = depthFormat;
             d.depthTest = true;
@@ -454,6 +460,7 @@ public class VkTerrainRenderer {
         this.packTranslucent = null;
         this.packDepthPipeline = null;
         this.pack = null;
+        this.packLayout = null;
         this.packOpaqueSamplers = List.of();
         this.packTranslucentSamplers = List.of();
     }
@@ -487,6 +494,11 @@ public class VkTerrainRenderer {
         MemoryUtil.memPutFloat(ptr + 404, viewport.height);
         MemoryUtil.memPutInt(ptr + 408, Math.round(VoxyConfig.CONFIG.sectionRenderDistance * 32));
         MemoryUtil.memPutInt(ptr + 412, 0);
+        //vxViewProj, its inverse and last frame's (Solas reads these)
+        var viewProj = new Matrix4f(proj).mul(viewport.modelView);
+        viewProj.getToAddress(ptr + 416);
+        new Matrix4f(viewProj).invert().getToAddress(ptr + 480);
+        new Matrix4f(this.packProjPrev).mul(this.packModelViewPrev).getToAddress(ptr + 544);
 
         //Next frame's "previous" pair
         this.packModelViewPrev.set(viewport.modelView);
@@ -661,16 +673,28 @@ public class VkTerrainRenderer {
      */
     public void renderDeferredTranslucent(VkViewport viewport) {
         var cmd = this.ctx.cmd();
-        viewport.colourSSAO.transition(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        //Every output starts each frame as transparent black: blended ones accumulate over it, and the
+        // coverage says where anything was drawn at all
+        var targets = new ArrayList<>(List.of(viewport.packTrans));
+        targets.add(viewport.packTransMeta);
+        var entries = new ArrayList<VkImage2D.BatchEntry>();
+        for (var image : targets) {
+            entries.add(new VkImage2D.BatchEntry(image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT));
+        }
+        VkImage2D.transitionBatch(entries, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        long[] views = new long[targets.size()];
         try (MemoryStack stack = stackPush()) {
-            var attach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
-                    .imageView(viewport.colourSSAO.view)
-                    .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-                    .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
-                    .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
-            attach.clearValue().color().float32(0, 0).float32(1, 0).float32(2, 0).float32(3, 0);
+            var attach = VkRenderingAttachmentInfoKHR.calloc(targets.size(), stack);
+            for (int i = 0; i < targets.size(); i++) {
+                views[i] = targets.get(i).view;
+                attach.get(i).sType$Default()
+                        .imageView(views[i])
+                        .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                        .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
+                        .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+                attach.get(i).clearValue().color().float32(0, 0).float32(1, 0).float32(2, 0).float32(3, 0);
+            }
             var info = VkRenderingInfoKHR.calloc(stack).sType$Default()
                     .renderArea(VkRect2D.calloc(stack).extent(e -> e.width(viewport.width).height(viewport.height)))
                     .layerCount(1)
@@ -681,7 +705,7 @@ public class VkTerrainRenderer {
         if (!this.hasPackTranslucent() || this.geometry.getSectionCount() == 0) return;
         int cap = Math.min(this.geometry.getSectionCount(), VkViewport.TRANSLUCENT_DRAW_COUNT);
         int maxDraw = this.fixedCountBudget(this.fbTranslucentDraws, 256, cap);
-        this.renderTerrain(viewport, new long[]{viewport.colourSSAO.view}, this.packTranslucent, this.packTranslucentSamplers,
+        this.renderTerrain(viewport, views, this.packTranslucent, this.packTranslucentSamplers,
                 TRANSLUCENT_OFFSET * 5L * 4, 4 * 4, maxDraw, false);
     }
 
@@ -910,12 +934,12 @@ public class VkTerrainRenderer {
 
     private void renderOpaqueTerrain(VkViewport viewport, long indirectOffset, long drawCountOffset, int maxDraw, boolean clear) {
         if (this.pack != null) {
-            long[] views = new long[2 + viewport.packData.length];
-            views[0] = viewport.colour.view;
-            for (int i = 0; i < viewport.packData.length; i++) {
-                views[1 + i] = viewport.packData[i].view;
+            var outputs = viewport.packOpaqueOutputs();
+            long[] views = new long[outputs.length + 1];
+            for (int i = 0; i < outputs.length; i++) {
+                views[i] = outputs[i].view;
             }
-            views[1 + viewport.packData.length] = viewport.packMeta.view;
+            views[outputs.length] = viewport.packMeta.view;
             this.renderTerrain(viewport, views, this.packOpaque, this.packOpaqueSamplers, indirectOffset, drawCountOffset, maxDraw, clear);
         } else {
             this.renderTerrain(viewport, new long[]{viewport.colour.view}, this.terrainOpaque, null, indirectOffset, drawCountOffset, maxDraw, clear);
@@ -928,11 +952,7 @@ public class VkTerrainRenderer {
         if (this.geometry.getSectionCount() == 0) return;
         int cap = Math.min(this.geometry.getSectionCount(), VkViewport.TRANSLUCENT_DRAW_COUNT);
         int maxDraw = this.fixedCountBudget(this.fbTranslucentDraws, 256, cap);
-        if (this.pack != null && this.packTranslucent != null) {
-            this.renderTerrain(viewport, new long[]{viewport.colourSSAO.view}, this.packTranslucent, this.packTranslucentSamplers,
-                    TRANSLUCENT_OFFSET * 5L * 4, 4 * 4, maxDraw, false);
-            return;
-        }
+        //(a pack's own translucent program is drawn by renderDeferredTranslucent instead)
         this.renderTerrain(viewport, new long[]{viewport.colourSSAO.view}, this.terrainTranslucent, null, TRANSLUCENT_OFFSET * 5L * 4, 4 * 4, maxDraw, false);
     }
 

@@ -231,10 +231,12 @@ public class VkRenderCore {
             // pack or setting change) and the frame takes the pack-mode targets. Null leaves Voxy's
             // own vanilla-lit path, which is also where a pack that fails to build ends up.
             VoxyPackPatch pack = VitrailVoxyPack.current();
-            if (!this.terrainRenderer.preparePack(pack, VK_FORMAT_D32_SFLOAT_S8_UINT)) {
+            PackLayout layout = this.packLayout(pack);
+            if (!this.terrainRenderer.preparePack(pack, layout, VK_FORMAT_D32_SFLOAT_S8_UINT)) {
                 pack = null;
+                layout = null;
             }
-            viewport.ensureTargets(pack == null ? -1 : pack.opaqueDataTargets().length);
+            viewport.ensureTargets(layout);
 
             var rt = new VkCompositor.VkViewportRT(viewport,
                     target.getColorTextureView(), target.getDepthTextureView(), target.width, target.height);
@@ -267,8 +269,12 @@ public class VkRenderCore {
             // opaque->temporal->SSAO->translucent order as the GL pipeline
             this.terrainRenderer.renderTemporal(viewport);
             //In shaderpack LOD mode too: the pack lights the LODs but has no ambient occlusion for them,
-            // their quads carrying none of the per-vertex AO real chunks do
-            this.ssao.compute(viewport, rt);
+            // their quads carrying none of the per-vertex AO real chunks do. Only on a lit colour: a pack
+            // that hands its deferred stage packed gbuffer data instead (Photon) shades the LODs there,
+            // its own screen space AO included
+            if (layout == null || layout.hasColour()) {
+                this.ssao.compute(viewport, rt);
+            }
             if (pack != null) {
                 //The pack's translucent LODs read the opaque depth (water depth fog, reflections)
                 this.compositor.offscreenToSampled(viewport);
@@ -286,7 +292,7 @@ public class VkRenderCore {
 
             //6. composite into MC's frame
             this.compositor.offscreenToSampled(viewport);
-            this.compositor.composite(rt, pack == null ? null : pack.opaqueDataTargets());
+            this.compositor.composite(rt);
             if (deferTranslucents) {
                 this.deferredTranslucents = rt;
             }
@@ -299,6 +305,26 @@ public class VkRenderCore {
             this.frameCtx.endFrame();
             this.frameCtx.pollRetired();
         }
+    }
+
+    private VoxyPackPatch layoutFor;
+    private PackLayout layoutCache;
+
+    //Read once per pack (Vitrail makes a new patch for every pack, setting and dimension change)
+    private PackLayout packLayout(VoxyPackPatch pack) {
+        if (pack == null) {
+            this.layoutFor = null;
+            this.layoutCache = null;
+            return null;
+        }
+        if (pack != this.layoutFor) {
+            this.layoutFor = pack;
+            this.layoutCache = PackLayout.of(pack);
+            if (this.layoutCache == null) {
+                VitrailVoxyPack.markFailed(pack, new IllegalStateException("the LOD programs' draw buffers cannot be served"));
+            }
+        }
+        return this.layoutCache;
     }
 
     /**

@@ -51,13 +51,10 @@ public class VkCompositor {
 
     private VkShaderPipeline depthSetup;
     private VkShaderPipeline composite;
-    private VkShaderPipeline compositeColortex0;
     private int setupDepthFormat = -1;
     private int compositeColorFormat = -1, compositeDepthFormat = -1;
-    private int colortex0ColorFormat = -1, colortex0DepthFormat = -1;
-    private int[] colortex0PackFormats = null;
-    private VkShaderPipeline compositeWater;
-    private int waterColorFormat = -1, waterDepthFormat = -1;//colour formats of the pack's data targets the pipeline writes, null = none
+    private boolean compositeColorWrite = true;
+    private boolean compositeCoverage = false;
 
     //Reused each frame for the composite-param matrices (no per-frame allocation)
     private final Matrix4f scratchA = new Matrix4f();
@@ -97,8 +94,14 @@ public class VkCompositor {
         this.setupDepthFormat = viewport.viewport.depthStencil.format;
     }
 
-    private void ensureCompositePipeline(int mcColorFormat, int mcDepthFormat) {
-        if (this.composite != null && this.compositeColorFormat == mcColorFormat && this.compositeDepthFormat == mcDepthFormat) return;
+    /**
+     * @param colorWrite false: only the depth goes in
+     * @param coverage   also writes the depth into Vitrail's coverage mask (a second, R32F attachment)
+     *                   and leaves MC's colour as it is
+     */
+    private void ensureCompositePipeline(int mcColorFormat, int mcDepthFormat, boolean colorWrite, boolean coverage) {
+        if (this.composite != null && this.compositeColorFormat == mcColorFormat && this.compositeDepthFormat == mcDepthFormat
+                && this.compositeColorWrite == colorWrite && this.compositeCoverage == coverage) return;
         if (this.composite != null) this.composite.free();
         var d = new VkShaderPipeline.GfxDesc();
         d.name = "composite";
@@ -107,126 +110,190 @@ public class VkCompositor {
                 .def("EMIT_COLOUR")
                 .def("HAS_FOG")
                 .def("HAS_FADE")
+                .defIf("COVERAGE_OUT", coverage)
+                .defIf("KEEP_TARGET_COLOUR", coverage)
                 .build());
-        d.colorFormat = mcColorFormat;
+        if (coverage) {
+            d.colorFormats = new int[]{mcColorFormat, VK_FORMAT_R32_SFLOAT};
+            d.attachmentBlend = new int[][]{OVER_BLEND, null};
+        } else {
+            d.colorFormat = mcColorFormat;
+            d.blend = true;
+            d.colorWrite = colorWrite;
+        }
         d.depthFormat = mcDepthFormat;
         d.stencilFormat = VK_FORMAT_UNDEFINED;
         d.depthTest = true;
         d.depthWrite = true;
         d.depthCompare = VkCmd.closerEqual(this.properties);
-        d.blend = true;
         d.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
         d.bindings = List.of(VkShaderPipeline.sampler(0), VkShaderPipeline.ubo(1), VkShaderPipeline.sampler(3));
         this.composite = new VkShaderPipeline(this.ctx, d);
         this.compositeColorFormat = mcColorFormat;
         this.compositeDepthFormat = mcDepthFormat;
+        this.compositeColorWrite = colorWrite;
+        this.compositeCoverage = coverage;
     }
 
     /**
-     * @param packFormats null outside shaderpack LOD mode, else the formats of the pack's data
-     *                    targets written beside colortex0 (possibly none)
+     * One composite of Voxy's offscreen images into the pack's targets (and, for the translucents, the
+     * game's depth). {@code dataFormats}/{@code dataModes}/{@code dataBlends} describe the outputs after
+     * the colour, see blit_texture_depth_cutout.frag.
      */
-    private void ensureCompositeColortex0Pipeline(int colorFormat, int depthFormat, int[] packFormats) {
-        if (this.compositeColortex0 != null && this.colortex0ColorFormat == colorFormat && this.colortex0DepthFormat == depthFormat
-                && java.util.Arrays.equals(this.colortex0PackFormats, packFormats)) return;
-        if (this.compositeColortex0 != null) this.compositeColortex0.free();
-        int dataCount = packFormats == null ? 0 : packFormats.length;
+    private record PackComposite(boolean packLod, boolean hasColour, int colourFormat, List<Integer> dataFormats,
+                                 int dataModes, List<List<Integer>> dataBlends, int depthFormat, boolean depthWrite) {}
+
+    private static final int[] OVER_BLEND = {VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+            VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA};
+
+    private final java.util.Map<PackComposite, VkShaderPipeline> packComposites = new java.util.HashMap<>();
+
+    private VkShaderPipeline packComposite(PackComposite spec) {
+        var pipeline = this.packComposites.get(spec);
+        if (pipeline != null) return pipeline;
+        int dataCount = spec.dataFormats.size();
         var d = new VkShaderPipeline.GfxDesc();
-        d.name = "composite-colortex0";
+        d.name = spec.depthWrite ? "composite-water" : "composite-colortex0";
         d.vertGlsl = VkShaderSource.load("voxy:post/fullscreen2.vert", VkShaderSource.defs().props(this.properties).build());
         d.fragGlsl = VkShaderSource.load("voxy:post/blit_texture_depth_cutout.frag", VkShaderSource.defs().props(this.properties)
                 .def("EMIT_COLOUR")
                 .def("HAS_FOG")
                 .def("HAS_FADE")
                 .def("VOXY_SHADER_FOG")
-                .defIf("PACK_LOD", packFormats != null)
+                .defIf("PACK_LOD", spec.packLod)
+                .def("PACK_HAS_COLOUR", spec.hasColour ? 1 : 0)
                 .def("PACK_DATA_COUNT", dataCount)
+                .def("PACK_DATA_MODES", spec.dataModes)
                 .build());
-        int[] formats = new int[1 + dataCount];
-        formats[0] = colorFormat;
+        int base = spec.hasColour ? 1 : 0;
+        int[] formats = new int[base + dataCount];
+        int[][] blends = new int[base + dataCount][];
+        if (spec.hasColour) {
+            formats[0] = spec.colourFormat;
+            blends[0] = OVER_BLEND;
+        }
         for (int i = 0; i < dataCount; i++) {
-            formats[1 + i] = packFormats[i];
+            formats[base + i] = spec.dataFormats.get(i);
+            var blend = spec.dataBlends.get(i);
+            blends[base + i] = blend == null ? null : blend.stream().mapToInt(Integer::intValue).toArray();
         }
         d.colorFormats = formats;
-        d.depthFormat = depthFormat;
+        d.attachmentBlend = blends;
+        d.depthFormat = spec.depthFormat;
         d.stencilFormat = VK_FORMAT_UNDEFINED;
         d.depthTest = true;
-        d.depthWrite = false;
+        //The translucents go into the game's depth like the real water: the pack takes depthtex0 from it
+        // after the translucents, while its depthtex1 was taken before them and keeps the floor under it
+        d.depthWrite = spec.depthWrite;
         d.depthCompare = VkCmd.closerEqual(this.properties);
-        d.blend = true;
         d.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
         var bindings = new java.util.ArrayList<>(List.of(VkShaderPipeline.sampler(0), VkShaderPipeline.ubo(1), VkShaderPipeline.sampler(3)));
         for (int i = 0; i < dataCount; i++) {
             bindings.add(VkShaderPipeline.sampler(4 + i));
         }
         d.bindings = bindings;
-        this.compositeColortex0 = new VkShaderPipeline(this.ctx, d);
-        this.colortex0ColorFormat = colorFormat;
-        this.colortex0DepthFormat = depthFormat;
-        this.colortex0PackFormats = packFormats == null ? null : packFormats.clone();
+        pipeline = new VkShaderPipeline(this.ctx, d);
+        this.packComposites.put(spec, pipeline);
+        return pipeline;
     }
 
-
-
-    private void ensureCompositeWaterPipeline(int colorFormat, int depthFormat) {
-        if (this.compositeWater != null && this.waterColorFormat == colorFormat && this.waterDepthFormat == depthFormat) return;
-        if (this.compositeWater != null) this.compositeWater.free();
-        var d = new VkShaderPipeline.GfxDesc();
-        d.name = "composite-water";
-        d.vertGlsl = VkShaderSource.load("voxy:post/fullscreen2.vert", VkShaderSource.defs().props(this.properties).build());
-        d.fragGlsl = VkShaderSource.load("voxy:post/blit_texture_depth_cutout.frag", VkShaderSource.defs().props(this.properties)
-                .def("EMIT_COLOUR")
-                .def("HAS_FOG")
-                .def("HAS_FADE")
-                .def("VOXY_SHADER_FOG")
-                .def("PACK_LOD")
-                .build());
-        d.colorFormat = colorFormat;
-        d.depthFormat = depthFormat;
-        d.stencilFormat = VK_FORMAT_UNDEFINED;
-        d.depthTest = true;
-        //Into the game's depth like the real water: the pack takes depthtex0 from it after the
-        // translucents, while its depthtex1 was taken before them and keeps the floor under the water
-        d.depthWrite = true;
-        d.depthCompare = VkCmd.closerEqual(this.properties);
-        d.blend = true;
-        d.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
-        d.bindings = List.of(VkShaderPipeline.sampler(0), VkShaderPipeline.ubo(1), VkShaderPipeline.sampler(3));
-        this.compositeWater = new VkShaderPipeline(this.ctx, d);
-        this.waterColorFormat = colorFormat;
-        this.waterDepthFormat = depthFormat;
+    private static List<List<Integer>> blendList(int[][] blends) {
+        var out = new java.util.ArrayList<List<Integer>>();
+        for (int[] b : blends) {
+            out.add(b == null ? null : java.util.Arrays.stream(b).boxed().toList());
+        }
+        return out;
     }
 
     /**
      * Shaderpack LOD mode: composites the LOD translucents (drawn after the pack's deferred stage into
-     * colourSSAO) into the colortex0 the pack's water writes, and their depth into the game's depth.
-     * Uses the composite params uploaded by this frame's composite().
+     * viewport.packTrans) into the targets the pack's water writes, and their depth into the game's
+     * depth. Uses the composite params uploaded by this frame's composite().
      */
     public void compositeTranslucents(VkViewportRT rt) {
         var viewport = rt.viewport();
-        GpuTextureView colortex0 = VitrailVoxyPack.writeTarget(0);
-        if (colortex0 == null) {
-            colortex0 = VitrailVkCompat.getColortex0();
-        }
-        if (colortex0 == null) return;
+        var layout = viewport.packLayout();
+        if (layout == null) return;
         var cmd = this.ctx.cmd();
-        viewport.colourSSAO.transition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-        int colorFormat = VkFrameHost.vkFormat(colortex0);
-        int depthFormat = VkFrameHost.vkFormat(rt.mcDepth());
-        this.ensureCompositeWaterPipeline(colorFormat, depthFormat);
 
+        //The output that goes to colortex0 is the colour (fogged, faded, and where nothing was drawn
+        // its alpha is zero); every other output that goes somewhere is data after it
+        int colourOutput = -1;
+        for (int i = 0; i < layout.translucentCount(); i++) {
+            int[] blend = layout.translucentBlends()[i];
+            if (layout.translucentBuffers()[i] == 0 && blend != null && blend[1] == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA) {
+                colourOutput = i;
+                break;
+            }
+        }
+        GpuTextureView colourTarget = null;
+        if (colourOutput >= 0) {
+            colourTarget = VitrailVoxyPack.writeTarget(0);
+            if (colourTarget == null) {
+                colourTarget = VitrailVkCompat.getColortex0();
+            }
+            if (colourTarget == null) return;
+        }
+        var dataTargets = new java.util.ArrayList<GpuTextureView>();
+        var dataImages = new java.util.ArrayList<VkImage2D>();
+        var dataFormats = new java.util.ArrayList<Integer>();
+        var dataBlends = new java.util.ArrayList<int[]>();
+        int dataModes = 0;
+        for (int i = 0; i < layout.translucentCount(); i++) {
+            int dest = layout.translucentBuffers()[i];
+            if (i == colourOutput || dest < 0) continue;
+            var target = VitrailVoxyPack.writeTarget(dest);
+            if (target == null) continue;
+            int[] blend = layout.translucentBlends()[i];
+            int mode = blend == null ? 0 : (blend[1] == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA ? 1 : 2);
+            dataModes |= mode << (2 * dataTargets.size());
+            dataBlends.add(mode == 0 ? null : mode == 1 ? OVER_BLEND : blend);
+            dataTargets.add(target);
+            dataImages.add(viewport.packTrans[i]);
+            dataFormats.add(VkFrameHost.vkFormat(target));
+        }
+        if (colourTarget == null && dataTargets.isEmpty()) return;
+        //Without a colour, where the translucent program drew at all
+        VkImage2D source = colourOutput >= 0 ? viewport.packTrans[colourOutput] : viewport.packTransMeta;
+
+        var sampled = new java.util.ArrayList<>(dataImages);
+        sampled.add(source);
+        for (var image : sampled) {
+            image.transition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+        }
+        int depthFormat = VkFrameHost.vkFormat(rt.mcDepth());
+        var pipeline = this.packComposite(new PackComposite(true, colourTarget != null,
+                colourTarget == null ? VK_FORMAT_UNDEFINED : VkFrameHost.vkFormat(colourTarget), List.copyOf(dataFormats),
+                dataModes, blendList(dataBlends.toArray(new int[0][])), depthFormat, true));
+
+        var attachments = new java.util.ArrayList<GpuTextureView>();
+        if (colourTarget != null) attachments.add(colourTarget);
+        attachments.addAll(dataTargets);
+        this.drawPackComposite(rt, pipeline, attachments, source, dataImages);
+    }
+
+    //Draws a pack composite over {@code attachments} (all of one size) and the game's depth
+    private void drawPackComposite(VkViewportRT rt, VkShaderPipeline pipeline, List<GpuTextureView> attachments,
+                                   VkImage2D source, List<VkImage2D> dataImages) {
+        var viewport = rt.viewport();
+        var cmd = this.ctx.cmd();
         VkFrameHost.barrierDepthAttachment(cmd, rt.mcDepth());
-        VkFrameHost.barrierColorAttachment(cmd, colortex0);
-        int width = colortex0.getWidth(0);
-        int height = colortex0.getHeight(0);
+        for (var target : attachments) {
+            VkFrameHost.barrierColorAttachment(cmd, target);
+        }
+        int width = attachments.get(0).getWidth(0);
+        int height = attachments.get(0).getHeight(0);
         try (MemoryStack stack = stackPush()) {
-            var colorAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
-                    .imageView(VkFrameHost.vkView(colortex0))
-                    .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-                    .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
-                    .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+            var colorAttach = VkRenderingAttachmentInfoKHR.calloc(attachments.size(), stack);
+            for (int i = 0; i < attachments.size(); i++) {
+                colorAttach.get(i).sType$Default()
+                        .imageView(VkFrameHost.vkView(attachments.get(i)))
+                        .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                        .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
+                        .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+            }
             var depthAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
                     .imageView(VkFrameHost.vkView(rt.mcDepth()))
                     .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
@@ -239,17 +306,22 @@ public class VkCompositor {
                     .pDepthAttachment(depthAttach);
             vkCmdBeginRenderingKHR(cmd, info);
         }
-        this.compositeWater.bind(cmd);
+        pipeline.bind(cmd);
         VkCmd.setViewportScissor(cmd, width, height);
-        try (var b = this.compositeWater.binder()) {
+        try (var b = pipeline.binder()) {
             b.sampler(0, viewport.depthSampleView, this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
                     .ubo(1, this.compositeParams)
-                    .sampler(3, viewport.colourSSAO.view, this.colourSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-                    .push(cmd);
+                    .sampler(3, source.view, this.colourSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            for (int i = 0; i < dataImages.size(); i++) {
+                b.sampler(4 + i, dataImages.get(i).view, this.colourSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            }
+            b.push(cmd);
         }
         vkCmdDraw(cmd, 4, 1, 0, 0);
         vkCmdEndRenderingKHR(cmd);
-        VkFrameHost.barrierColorAttachment(cmd, colortex0);
+        for (var target : attachments) {
+            VkFrameHost.barrierColorAttachment(cmd, target);
+        }
         VkFrameHost.barrierDepthAttachment(cmd, rt.mcDepth());
     }
 
@@ -377,10 +449,9 @@ public class VkCompositor {
     }
 
     /**
-     * COMPOSITE pass into colortex0 (when a Vitrail pack is drawing) and MC's frame attachments.
-     * @param packDataIndices in shaderpack LOD mode, the colortex indices of viewport.packData
+     * COMPOSITE pass into the pack's targets (when a Vitrail pack is drawing) and MC's frame attachments.
      */
-    public void composite(VkViewportRT rt, int[] packDataIndices) {
+    public void composite(VkViewportRT rt) {
         var viewport = rt.viewport;
         boolean fogCoversAllRendering = viewport.fogParameters != null
                 && viewport.fogParameters.environmentalEnd() > 0.0f
@@ -388,17 +459,34 @@ public class VkCompositor {
         if (fogCoversAllRendering) {
             return;//mirrors the GL "fog covers everything -> skip blit" branch
         }
+        var layout = viewport.packLayout();
+        //A pack whose LOD programs write no colour leaves MC's colour alone: only where the LODs are
+        // (packMeta, alpha 1 under every opaque LOD) and their depth go in
+        boolean emitsColour = layout == null || layout.hasColour();
 
         int mcColorFormat = VkFrameHost.vkFormat(rt.mcColour);
         int mcDepthFormat = VkFrameHost.vkFormat(rt.mcDepth);
-        this.ensureCompositePipeline(mcColorFormat, mcDepthFormat);
+        //Vitrail paints the game's own picture into the terrain's first draw buffer wherever its coverage
+        // mask does not claim the pixel for the pack. With a colour LOD that buffer is colortex0 and the
+        // picture painted back is the LODs' own (they are composited into it below); without one it is
+        // pack data (Photon's colortex1), and the picture painted over the LODs was the sky. So there the
+        // LODs claim their pixels in the mask, with the very depth they leave in the game's depth, which
+        // is what the mask holds for the pack's own terrain
+        GpuTextureView coverage = emitsColour ? null : VitrailVoxyPack.coverage();
+        if (coverage != null && (coverage.getWidth(0) != rt.mcWidth || coverage.getHeight(0) != rt.mcHeight
+                || VkFrameHost.vkFormat(coverage) != VK_FORMAT_R32_SFLOAT
+                //the mask is compared for equality with the depth as stored, which a float depth keeps exactly
+                || (mcDepthFormat != VK_FORMAT_D32_SFLOAT && mcDepthFormat != VK_FORMAT_D32_SFLOAT_S8_UINT))) {
+            coverage = null;
+        }
+        this.ensureCompositePipeline(mcColorFormat, mcDepthFormat, emitsColour, coverage != null);
         var cmd = this.ctx.cmd();
 
         this.uploadCompositeParams(viewport);
 
         //SSAO output colour (with translucents composited on top) -> sampled, along with the
         // shaderpack's other draw buffers in shaderpack LOD mode
-        VkImage2D source = viewport.colourSSAO;
+        VkImage2D source = emitsColour ? viewport.colourSSAO : viewport.packMeta;
         source.transition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
@@ -416,27 +504,35 @@ public class VkCompositor {
         // fragment shaders producing a bit-identical gl_FragDepth). Any 1-ulp difference dropped
         // that pixel, and since the value changes with the camera this showed up as LOD speckle that
         // flickered while moving.
-        GpuTextureView[] dataTargets = viewport.isPackMode() ? packDataTargets(viewport, packDataIndices) : null;
-        GpuTextureView colortex0 = null;
-        if (viewport.isPackMode()) {
-            colortex0 = VitrailVoxyPack.writeTarget(0);
-        }
-        if (colortex0 == null) {
-            colortex0 = VitrailVkCompat.getColortex0();
-        }
-        if (colortex0 != null) {
-            this.compositeIntoColortex0(rt, colortex0, mcDepthFormat, source, dataTargets);
+        if (layout != null) {
+            this.compositeIntoPack(rt, layout, mcDepthFormat, source);
+        } else {
+            GpuTextureView colortex0 = VitrailVkCompat.getColortex0();
+            if (colortex0 != null) {
+                this.compositeIntoColortex0(rt, colortex0, mcDepthFormat, source);
+            }
         }
 
         VkFrameHost.barrierColorAttachment(cmd, rt.mcColour);
         VkFrameHost.barrierDepthAttachment(cmd, rt.mcDepth);
+        if (coverage != null) {
+            VkFrameHost.barrierColorAttachment(cmd, coverage);
+        }
 
         try (MemoryStack stack = stackPush()) {
-            var colorAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
+            var colorAttach = VkRenderingAttachmentInfoKHR.calloc(coverage != null ? 2 : 1, stack);
+            colorAttach.get(0).sType$Default()
                     .imageView(VkFrameHost.vkView(rt.mcColour))
                     .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
                     .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
                     .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+            if (coverage != null) {
+                colorAttach.get(1).sType$Default()
+                        .imageView(VkFrameHost.vkView(coverage))
+                        .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                        .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
+                        .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+            }
             var depthAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
                     .imageView(VkFrameHost.vkView(rt.mcDepth))
                     .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
@@ -461,83 +557,55 @@ public class VkCompositor {
         vkCmdEndRenderingKHR(cmd);
 
         VkFrameHost.barrierColorAttachment(cmd, rt.mcColour);
-    }
-
-    /** The pack's own targets its other opaque draw buffers go to, or null if any of them is missing. */
-    private static GpuTextureView[] packDataTargets(VkViewport viewport, int[] indices) {
-        if (indices == null || indices.length != viewport.packData.length) return null;
-        var out = new GpuTextureView[indices.length];
-        for (int i = 0; i < indices.length; i++) {
-            out[i] = VitrailVoxyPack.writeTarget(indices[i]);
-            if (out[i] == null) return null;
+        if (coverage != null) {
+            VkFrameHost.barrierColorAttachment(cmd, coverage);
         }
-        return out;
     }
 
-    private void compositeIntoColortex0(VkViewportRT rt, GpuTextureView colortex0, int mcDepthFormat,
-                                        VkImage2D source, GpuTextureView[] dataTargets) {
+    //Voxy's own (vanilla-lit) LODs into colortex0 of a pack that has no LOD programs
+    private void compositeIntoColortex0(VkViewportRT rt, GpuTextureView colortex0, int mcDepthFormat, VkImage2D source) {
+        var pipeline = this.packComposite(new PackComposite(false, true, VkFrameHost.vkFormat(colortex0), List.of(),
+                0, List.of(), mcDepthFormat, false));
+        this.drawPackComposite(rt, pipeline, List.of(colortex0), source, List.of());
+    }
+
+    //The opaque outputs of a pack's LOD programs into the targets its voxy.json names: the colour (with
+    // the fog and fade) into colortex0, everything else copied as the pack wrote it
+    private void compositeIntoPack(VkViewportRT rt, PackLayout layout, int mcDepthFormat, VkImage2D source) {
         var viewport = rt.viewport;
-        var cmd = this.ctx.cmd();
-
-        int colortex0Format = VkFrameHost.vkFormat(colortex0);
-        int[] packFormats = null;
-        if (viewport.isPackMode()) {
-            packFormats = new int[dataTargets == null ? 0 : dataTargets.length];
-            for (int i = 0; i < packFormats.length; i++) {
-                packFormats[i] = VkFrameHost.vkFormat(dataTargets[i]);
+        GpuTextureView colourTarget = null;
+        if (layout.hasColour()) {
+            colourTarget = VitrailVoxyPack.writeTarget(0);
+            if (colourTarget == null) {
+                colourTarget = VitrailVkCompat.getColortex0();
             }
+            if (colourTarget == null) return;
         }
-        this.ensureCompositeColortex0Pipeline(colortex0Format, mcDepthFormat, packFormats);
-        int dataCount = packFormats == null ? 0 : packFormats.length;
-
-        VkFrameHost.barrierDepthAttachment(cmd, rt.mcDepth);
-        VkFrameHost.barrierColorAttachment(cmd, colortex0);
-        for (int i = 0; i < dataCount; i++) {
-            VkFrameHost.barrierColorAttachment(cmd, dataTargets[i]);
-        }
-
-        int width = colortex0.getWidth(0);
-        int height = colortex0.getHeight(0);
-
-        try (MemoryStack stack = stackPush()) {
-            var colorAttach = VkRenderingAttachmentInfoKHR.calloc(1 + dataCount, stack);
-            for (int i = 0; i <= dataCount; i++) {
-                colorAttach.get(i).sType$Default()
-                        .imageView(VkFrameHost.vkView(i == 0 ? colortex0 : dataTargets[i - 1]))
-                        .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-                        .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
-                        .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+        var dataTargets = new java.util.ArrayList<GpuTextureView>();
+        var dataFormats = new java.util.ArrayList<Integer>();
+        for (int i = 0; i < layout.opaqueCount(); i++) {
+            if (i == layout.colourOutput()) continue;
+            var target = VitrailVoxyPack.writeTarget(layout.opaqueBuffers()[i]);
+            if (target == null) {
+                //All of the data or none of it, the pack's stages read it together: the colour alone
+                dataTargets.clear();
+                dataFormats.clear();
+                if (colourTarget == null) return;
+                break;
             }
-            var depthAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
-                    .imageView(VkFrameHost.vkView(rt.mcDepth))
-                    .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-                    .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
-                    .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
-            var info = VkRenderingInfoKHR.calloc(stack).sType$Default()
-                    .renderArea(VkRect2D.calloc(stack).extent(e -> e.width(width).height(height)))
-                    .layerCount(1)
-                    .pColorAttachments(colorAttach)
-                    .pDepthAttachment(depthAttach);
-            vkCmdBeginRenderingKHR(cmd, info);
+            dataTargets.add(target);
+            dataFormats.add(VkFrameHost.vkFormat(target));
         }
-        this.compositeColortex0.bind(cmd);
-        VkCmd.setViewportScissor(cmd, width, height);
-        try (var b = this.compositeColortex0.binder()) {
-            b.sampler(0, viewport.depthSampleView, this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-                    .ubo(1, this.compositeParams)
-                    .sampler(3, source.view, this.colourSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            for (int i = 0; i < dataCount; i++) {
-                b.sampler(4 + i, viewport.packData[i].view, this.colourSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            }
-            b.push(cmd);
-        }
-        vkCmdDraw(cmd, 4, 1, 0, 0);
-        vkCmdEndRenderingKHR(cmd);
-
-        VkFrameHost.barrierColorAttachment(cmd, colortex0);
-        for (int i = 0; i < dataCount; i++) {
-            VkFrameHost.barrierColorAttachment(cmd, dataTargets[i]);
-        }
+        int data = dataTargets.size();
+        var blends = new java.util.ArrayList<List<Integer>>();
+        for (int i = 0; i < data; i++) blends.add(null);
+        var pipeline = this.packComposite(new PackComposite(true, colourTarget != null,
+                colourTarget == null ? VK_FORMAT_UNDEFINED : VkFrameHost.vkFormat(colourTarget), List.copyOf(dataFormats),
+                0, blends, mcDepthFormat, false));
+        var attachments = new java.util.ArrayList<GpuTextureView>();
+        if (colourTarget != null) attachments.add(colourTarget);
+        attachments.addAll(dataTargets);
+        this.drawPackComposite(rt, pipeline, attachments, source, List.of(viewport.packData).subList(0, data));
     }
 
     private void uploadCompositeParams(VkViewport viewport) {
@@ -576,6 +644,17 @@ public class VkCompositor {
                 float fadeStart = rd * 0.90f;
                 float fadeEnd = rd;
                 float scale = 1.0f / Math.max(1.0f, fadeEnd - fadeStart);
+                fadeY = -fadeStart * scale;
+                fadeZ = scale;
+                fadeW = 0.0f;
+            } else if (Boolean.FALSE.equals(VitrailVoxyPack.loadedHasComplementaryFog())) {
+                // A pack with LOD programs of its own and no border fog setting fogs the LODs itself:
+                // only the fade at the outer edge of Voxy's render distance, into the pack's sky
+                float rd = VitrailVkCompat.getVoxyRenderDistanceBlocks();
+                f3 = 0.0f;
+                fadeMode = 2.0f;
+                float fadeStart = rd * 0.90f;
+                float scale = 1.0f / Math.max(1.0f, rd - fadeStart);
                 fadeY = -fadeStart * scale;
                 fadeZ = scale;
                 fadeW = 0.0f;
@@ -671,8 +750,10 @@ public class VkCompositor {
     public void free() {
         if (this.depthSetup != null) this.depthSetup.free();
         if (this.composite != null) this.composite.free();
-        if (this.compositeColortex0 != null) this.compositeColortex0.free();
-        if (this.compositeWater != null) this.compositeWater.free();
+        for (var pipeline : this.packComposites.values()) {
+            pipeline.free();
+        }
+        this.packComposites.clear();
         //depthSampler/colourSampler come from VkImage2D.createSampler's
         // device-lifetime cache (shared across compositor/SSAO/terrain); never
         // destroy them per-object (double vkDestroySampler -> SIGSEGV on unload)

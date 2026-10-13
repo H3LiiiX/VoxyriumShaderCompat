@@ -42,9 +42,13 @@ public final class VoxyPackPatch {
             {"mat4", "vxProj"}, {"mat4", "vxProjInv"}, {"mat4", "vxProjPrev"},
             {"vec4", "voxy_depthConv"},
             {"float", "viewWidth"}, {"float", "viewHeight"}, {"int", "vxRenderDistance"},
+            //Appended after the rest so every member before keeps its offset
+            {"mat4", "vxViewProj"}, {"mat4", "vxViewProjInv"}, {"mat4", "vxViewProjPrev"},
     };
-    public static final int FRAME_BLOCK_BYTES = 6 * 64 + 16 + 16;
+    public static final int FRAME_BLOCK_BYTES = 6 * 64 + 16 + 16 + 3 * 64;
     public static final int MAX_PACK_UNIFORM_BYTES = 16 * 1024;
+    //Colour attachments a pass may write besides Voxy's own (the SSAO / coverage flags after them)
+    public static final int MAX_DRAW_BUFFERS = 6;
 
     public record Sampler(String name, String type, int binding) {}
 
@@ -62,19 +66,21 @@ public final class VoxyPackPatch {
     private final List<Sampler> samplers;
     private final int[] opaqueDrawBuffers;
     private final int[] translucentDrawBuffers;
-    private final Blend translucentBlend;
+    private final Blend[] translucentBlends;
     private final List<String> notes = new ArrayList<>();
     private final String glue;
 
     private VoxyPackPatch(String opaqueSource, String translucentSource, List<String> uniforms, Map<String, String> uniformTypes,
-                          List<Sampler> samplers, int[] opaqueDrawBuffers, int[] translucentDrawBuffers, Blend translucentBlend) {
+                          List<Sampler> samplers, int[] opaqueDrawBuffers, int[] translucentDrawBuffers, Blend[] translucentBlends,
+                          List<String> notes) {
         this.opaqueSource = opaqueSource;
         this.translucentSource = translucentSource;
         this.uniforms = uniforms;
         this.samplers = samplers;
         this.opaqueDrawBuffers = opaqueDrawBuffers;
         this.translucentDrawBuffers = translucentDrawBuffers;
-        this.translucentBlend = translucentBlend;
+        this.translucentBlends = translucentBlends;
+        this.notes.addAll(notes);
 
         Set<String> frameNames = new HashSet<>();
         for (var m : FRAME_MEMBERS) frameNames.add(m[1]);
@@ -102,8 +108,11 @@ public final class VoxyPackPatch {
      * @param opaque        the pack's voxy_opaque program, expanded, with the defines it needs ahead of it
      * @param translucent   the same for voxy_translucent, or null when the pack has none
      * @param declaredTypes the GLSL type each uniform is declared with somewhere in the pack
+     * @param ownDeclared   the {@code uniform type name;} lines the LOD programs themselves declare
+     *                      outside any block (in code that is compiled), name to type
      */
-    public static VoxyPackPatch parse(String jsonText, String opaque, String translucent, Map<String, String> declaredTypes) {
+    public static VoxyPackPatch parse(String jsonText, String opaque, String translucent, Map<String, String> declaredTypes,
+                                      Map<String, String> ownDeclared) {
         JsonObject json = parseJson(jsonText);
         int version = json.has("version") ? json.get("version").getAsInt() : -1;
         if (version != 1) {
@@ -137,25 +146,61 @@ public final class VoxyPackPatch {
             }
         }
 
+        //Under Iris a uniform the programs declare themselves is an ordinary uniform of the GL program
+        // (Voxy only answers vxDepthTexOpaque / vxDepthTexTrans that way, which Photon reads without
+        // listing). Here every one has to be in the glue, with a binding, so the declaration moves there:
+        // a sampler as one more sampler, anything else into the pack block, answered by Vitrail by name
+        List<String> notes = new ArrayList<>();
+        Set<String> hoisted = new HashSet<>();
+        if (ownDeclared != null) {
+            Set<String> samplerNames = new HashSet<>();
+            for (var s : samplers) samplerNames.add(s.name());
+            for (var e : ownDeclared.entrySet()) {
+                String name = e.getKey(), type = e.getValue();
+                if (type.startsWith("sampler") || type.startsWith("usampler") || type.startsWith("isampler")) {
+                    if (samplerNames.add(name)) {
+                        samplers.add(new Sampler(name, type, binding++));
+                        notes.add("the LOD programs declare the sampler " + name + " without listing it, it is served by name");
+                    }
+                } else if (!uniforms.contains(name)) {
+                    uniforms.add(name);
+                    declaredTypes = new HashMap<>(declaredTypes);
+                    declaredTypes.put(name, type);
+                    notes.add("the LOD programs declare the uniform " + name + " without listing it, it is answered by name");
+                }
+                hoisted.add(name);
+            }
+        }
+
         int[] opaqueBuffers = intArray(json, "opaqueDrawBuffers", new int[]{0});
         int[] translucentBuffers = intArray(json, "translucentDrawBuffers", new int[]{0});
-        if (opaqueBuffers.length == 0 || opaqueBuffers[0] != 0) {
-            throw new IllegalStateException("the first opaque draw buffer has to be colortex0");
-        }
-        if (opaqueBuffers.length > 4) {
-            throw new IllegalStateException("at most 4 opaque draw buffers are supported, the pack writes " + opaqueBuffers.length);
-        }
-        if (translucentBuffers.length != 1 || translucentBuffers[0] != 0) {
-            throw new IllegalStateException("translucent LODs can only be drawn into colortex0");
-        }
+        checkDrawBuffers("opaque", opaqueBuffers);
+        checkDrawBuffers("translucent", translucentBuffers);
 
-        Blend blend = DEFAULT_BLEND;
+        Blend[] blends = new Blend[translucentBuffers.length];
+        java.util.Arrays.fill(blends, DEFAULT_BLEND);
         if (json.has("blending")) {
-            blend = parseBlend(json.get("blending"));
+            parseBlend(json.get("blending"), blends);
         }
 
-        return new VoxyPackPatch(patchSource(opaque), translucent == null ? null : patchSource(translucent), uniforms,
-                declaredTypes, samplers, opaqueBuffers, translucentBuffers, blend);
+        return new VoxyPackPatch(patchSource(opaque, hoisted), translucent == null ? null : patchSource(translucent, hoisted), uniforms,
+                declaredTypes, samplers, opaqueBuffers, translucentBuffers, blends, notes);
+    }
+
+    private static void checkDrawBuffers(String pass, int[] buffers) {
+        if (buffers.length == 0) {
+            throw new IllegalStateException("the " + pass + " LODs draw into no buffer");
+        }
+        if (buffers.length > MAX_DRAW_BUFFERS) {
+            throw new IllegalStateException("at most " + MAX_DRAW_BUFFERS + " " + pass + " draw buffers are supported, the pack writes "
+                    + buffers.length);
+        }
+        Set<Integer> seen = new HashSet<>();
+        for (int b : buffers) {
+            if (b < 0 || !seen.add(b)) {
+                throw new IllegalStateException("the " + pass + " draw buffers " + java.util.Arrays.toString(buffers) + " are not distinct colour targets");
+            }
+        }
     }
 
     private static final Pattern UNUSED_STRING = Pattern.compile("\"unusedString\"\\s*:\\s*\".*?\"\\s*,(?=\\s*\"[A-Za-z_]\\w*\"\\s*:)", Pattern.DOTALL);
@@ -193,15 +238,31 @@ public final class VoxyPackPatch {
         return out;
     }
 
-    //Only buffer 0 exists for translucents here, so the answer is buffer 0's entry, else the -1
-    // (every buffer) entry, else the default
-    private static Blend parseBlend(JsonElement element) {
+    //Keyed as upstream Voxy keys it: by position in translucentDrawBuffers, -1 standing for every buffer
+    // and applied first, so a buffer's own entry wins over it
+    private static void parseBlend(JsonElement element, Blend[] out) {
         if (element.isJsonPrimitive()) {
-            return element.getAsString().equalsIgnoreCase("off") ? null : DEFAULT_BLEND;
+            java.util.Arrays.fill(out, element.getAsString().equalsIgnoreCase("off") ? null : DEFAULT_BLEND);
+            return;
         }
         JsonObject object = element.getAsJsonObject();
-        JsonElement entry = object.has("0") ? object.get("0") : object.get("-1");
-        if (entry == null) return DEFAULT_BLEND;
+        if (object.has("-1")) {
+            java.util.Arrays.fill(out, blendEntry(object.get("-1")));
+        }
+        for (var e : object.entrySet()) {
+            int buffer;
+            try {
+                buffer = Integer.parseInt(e.getKey().trim());
+            } catch (NumberFormatException ignored) {
+                continue;
+            }
+            if (buffer >= 0 && buffer < out.length) {
+                out[buffer] = blendEntry(e.getValue());
+            }
+        }
+    }
+
+    private static Blend blendEntry(JsonElement entry) {
         List<String> parts;
         if (entry.isJsonArray()) {
             parts = new ArrayList<>();
@@ -240,9 +301,42 @@ public final class VoxyPackPatch {
     //gl_FragCoord.z is the depth Voxy rasterised with (reversed Z on this backend) and the pack reads
     // the OpenGL window depth, so every read goes through voxy_FragCoord, which converts it the same
     // way the matrices handed over are converted. A #define cannot do it, the gl_ prefix is reserved.
-    private static String patchSource(String source) {
+    private static String patchSource(String source, Set<String> hoisted) {
         source = VERSION.matcher(source).replaceAll("");
+        if (!hoisted.isEmpty()) {
+            //The declarations parse() moved into the glue; blanked rather than removed so line numbers
+            // in a compile error still point at the pack's own lines
+            StringBuilder out = new StringBuilder(source.length());
+            for (String line : source.split("\n", -1)) {
+                Matcher m = OWN_UNIFORM_LINE.matcher(line);
+                if (m.matches() && hoisted.contains(m.group(2))) {
+                    line = "";
+                }
+                out.append(line).append('\n');
+            }
+            source = out.substring(0, out.length() - 1);
+        }
+        //Words Vulkan GLSL reserves for its separate sampler types and OpenGL leaves free, which a pack
+        // may use as names (Photon's bicubic filter takes a "sampler2D sampler")
+        source = VK_RESERVED.matcher(source).replaceAll("voxy_$1");
         return FRAG_COORD.matcher(source).replaceAll("voxy_FragCoord");
+    }
+
+    private static final Pattern VK_RESERVED = Pattern.compile("\\b(sampler|samplerShadow)\\b");
+
+    //One plain declaration on its own line: no layout, no initialiser, no list
+    private static final Pattern OWN_UNIFORM_LINE = Pattern.compile("\\s*uniform\\s+(\\w+)\\s+(\\w+)\\s*;\\s*(?://.*)?");
+
+    /**
+     * Collects the declaration a line of the LOD programs makes outside any block, if it is one that
+     * parse() can move into the glue. Only lines that are compiled should be handed in.
+     */
+    public static void collectOwnUniform(String line, Map<String, String> into) {
+        if (!line.contains("uniform")) return;
+        Matcher m = OWN_UNIFORM_LINE.matcher(line);
+        if (m.matches()) {
+            into.putIfAbsent(m.group(2), m.group(1));
+        }
     }
 
     //=================================== emitting ===================================
@@ -286,15 +380,19 @@ public final class VoxyPackPatch {
         return this.translucentSource != null;
     }
 
-    /** The colortex indices the opaque pass writes after colortex0, in output order. */
-    public int[] opaqueDataTargets() {
-        int[] out = new int[this.opaqueDrawBuffers.length - 1];
-        System.arraycopy(this.opaqueDrawBuffers, 1, out, 0, out.length);
-        return out;
+    /** The colortex index each output of the opaque program goes to, in output (location) order. */
+    public int[] opaqueDrawBuffers() {
+        return this.opaqueDrawBuffers.clone();
     }
 
-    public Blend translucentBlend() {
-        return this.translucentBlend;
+    /** The colortex index each output of the translucent program goes to, in output (location) order. */
+    public int[] translucentDrawBuffers() {
+        return this.translucentDrawBuffers.clone();
+    }
+
+    /** The blend of each translucent output, null where blending is off. */
+    public Blend[] translucentBlends() {
+        return this.translucentBlends.clone();
     }
 
     public List<Sampler> samplers() {
@@ -344,6 +442,12 @@ public final class VoxyPackPatch {
                 names.put(target, s.toString());
             } else if (op == 61 && count >= 4) {//OpLoad type result pointer
                 loaded.add(buf.getInt(base + (i + 3) * 4));
+            } else if (op == 57 && count >= 4) {//OpFunctionCall type result function args...
+                //A sampler handed to a function as an argument (BSL's Raytrace(depthtex1, ...)) is loaded
+                // inside it through the parameter, never through the variable itself
+                for (int w = i + 4; w < i + count; w++) {
+                    loaded.add(buf.getInt(base + w * 4));
+                }
             }
             i += count;
         }
@@ -365,6 +469,23 @@ public final class VoxyPackPatch {
         Matcher m = UNIFORM_DECL.matcher(line);
         while (m.find()) {
             into.putIfAbsent(m.group(2), m.group(1));
+        }
+    }
+
+    private static final Pattern UNIFORM_LIST = Pattern.compile("\\buniform\\s+(\\w+)\\s+(\\w+(?:\\s*,\\s*\\w+)+)\\s*;");
+
+    /**
+     * Collects the names of {@code uniform type a, b, c;} lists (BSL and Solas declare most of theirs
+     * that way). Only fills names collectUniformTypes found no declaration for, so it is run after it
+     * has seen every line.
+     */
+    public static void collectUniformListTypes(String line, Map<String, String> into) {
+        if (!line.contains("uniform") || line.indexOf(',') < 0) return;
+        Matcher m = UNIFORM_LIST.matcher(line);
+        while (m.find()) {
+            for (String name : m.group(2).split(",")) {
+                into.putIfAbsent(name.trim(), m.group(1));
+            }
         }
     }
 }
