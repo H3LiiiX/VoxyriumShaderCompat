@@ -94,6 +94,24 @@ vec2 getBaseUV() {
 }
 
 
+#ifdef VOXY_SMOOTH_LIGHT
+layout(location = 2) in vec3 voxyPos;
+layout(location = 3) in flat vec2 voxyPlane;//lod scale, the face plane's offset along its axis
+#ifdef VOXY_LIGHT_PREPASS
+//The light of every visible LOD pixel and the plane its face lies on: (light map uv, face, plane offset)
+layout(location = 0) out vec4 voxyLightOut;
+#else
+layout(binding = 6) uniform sampler2D voxyLightTex;//what the prepass wrote
+#endif
+#endif
+
+#ifdef PACK_ANIMATED_WATER
+//Shaderpack LOD programs: water is drawn with Minecraft's own (animated) water sprite rather than
+// the frame Voxy baked into its atlas, so it moves like the water in real chunks
+layout(binding = 7) uniform sampler2D voxyWaterAtlas;
+layout(push_constant) uniform VoxyWaterPush { vec4 voxyWaterSprite; };//u0, v0, u1, v1 of water_still
+#endif
+
 #ifdef PATCHED_SHADER
 struct VoxyFragmentParameters {
     //TODO: pass in derivative data
@@ -108,6 +126,55 @@ struct VoxyFragmentParameters {
 };
 
 void voxy_emitFragment(VoxyFragmentParameters parameters);
+
+#if defined(VOXY_SMOOTH_LIGHT) && !defined(VOXY_LIGHT_PREPASS)
+vec3 voxyAxis(uint axis) {
+    return axis == 0u ? vec3(0, 1, 0) : (axis == 1u ? vec3(0, 0, 1) : vec3(1, 0, 0));
+}
+
+//An LOD face carries a single light value for the block in front of it, so torch light shows every
+// block of a merged quad as a step where real chunks (vanilla smooth lighting) fade from block to
+// block. Blend the light between the four nearest block centres on the face's plane, reading each from
+// the prepass where that centre lands on screen, as long as it is the same face on the same plane
+// (anything else, off screen, hidden or another surface, keeps this block's own light)
+vec2 voxySmoothLight(vec2 own, uint face) {
+    uint axis = face >> 1;
+    vec3 t1 = voxyAxis((axis + 1u) % 3u);
+    vec3 t2 = voxyAxis((axis + 2u) % 3u);
+    float scale = voxyPlane.x;
+    vec2 onPlane = vec2(dot(voxyPos, t1), dot(voxyPos, t2)) / scale;
+    vec2 q = onPlane - 0.5;
+    vec2 base = floor(q);
+    vec2 w = q - base;
+    vec2 size = vec2(textureSize(voxyLightTex, 0));
+    vec2 result = vec2(0);
+    for (int i = 0; i < 4; i++) {
+        vec2 corner = vec2(i & 1, i >> 1);
+        vec2 centre = base + corner + 0.5;
+        vec3 point = voxyPos + (t1 * (centre.x - onPlane.x) + t2 * (centre.y - onPlane.y)) * scale;
+        vec4 clip = MVP * vec4(point, 1.0);
+        vec2 light = own;
+        if (clip.w > 0.0) {
+            vec2 screen = clip.xy / clip.w * 0.5 + 0.5;
+            if (all(greaterThanEqual(screen, vec2(0.0))) && all(lessThan(screen, vec2(1.0)))) {
+                vec4 sampled = texelFetch(voxyLightTex, ivec2(screen * size), 0);
+                if (sampled.z == float(face) && abs(sampled.w - voxyPlane.y) < 0.01 * scale) {
+                    light = sampled.xy;
+                }
+            }
+        }
+        vec2 weight2 = mix(1.0 - w, w, corner);
+        result += light * (weight2.x * weight2.y);
+    }
+    return result;
+}
+#endif
+
+#ifdef VOXY_PACK_AO_LOCATION
+//The face and AO flag Voxy's SSAO pass reads (the unpatched path packs them into the colour's alpha,
+// which here is the pack's), in the output after the pack's own draw buffers
+layout(location = VOXY_PACK_AO_LOCATION) out vec4 voxyPackAO;
+#endif
 #else
 
 vec4 computeColour(vec2 texturePos, vec4 colour) {
@@ -158,6 +225,11 @@ void main() {
         vec2 dy = dFdy(uvSmol);//vec2(lDy, dDy);
         colour = textureGrad(blockModelAtlas, texPos, dx, dy);
     }// else {
+    #ifdef PACK_ANIMATED_WATER
+    //Taken here, before helper invocations leave, like the gradients above
+    vec2 waterDx = dFdx(uv);
+    vec2 waterDy = dFdy(uv);
+    #endif
     //    colour = textureLod(blockModelAtlas, texPos, 0);
     //}
 
@@ -232,9 +304,37 @@ void main() {
         tint = uint2vec4RGBA(interData.z).yzwx;
     }
 
+    #ifdef PACK_ANIMATED_WATER
+    if (modelIsFluid(model) && modelIsTranslucent(model)) {
+        vec2 spriteSize = voxyWaterSprite.zw - voxyWaterSprite.xy;
+        colour = textureGrad(voxyWaterAtlas, voxyWaterSprite.xy + fract(uv) * spriteSize, waterDx * spriteSize, waterDy * spriteSize);
+    }
+    #endif
+
+    #ifdef VOXY_VULKAN
+    //Minecraft's Vulkan backend rasterises with clockwise front faces (the projection Voxy shares
+    // with it is not flipped for Vulkan's framebuffer), while Voxy's pipelines declare
+    // counter-clockwise, so gl_FrontFacing reads the other way round from OpenGL. Taken as is, every
+    // LOD normal handed to the shaderpack pointed into the block.
+    bool frontFacing = !gl_FrontFacing;
+    #else
+    bool frontFacing = gl_FrontFacing;
+    #endif
     uint face = getFace();
-    face ^= uint((face&1u)!=uint(gl_FrontFacing!=((face>>1)!=0u)));
-    voxy_emitFragment(VoxyFragmentParameters(colour, tile, texPos, face, modelId, getLightmapUv(interData.y), tint, model.customId));
+    face ^= uint((face&1u)!=uint(frontFacing!=((face>>1)!=0u)));
+    vec2 lightUv = getLightmapUv(interData.y);
+    #ifdef VOXY_LIGHT_PREPASS
+    voxyLightOut = vec4(lightUv, float(face), voxyPlane.y);
+    return;
+    #else
+    #ifdef VOXY_SMOOTH_LIGHT
+    lightUv = voxySmoothLight(lightUv, face);
+    #endif
+    voxy_emitFragment(VoxyFragmentParameters(colour, tile, texPos, face, modelId, lightUv, tint, model.customId));
+    #endif
+    #ifdef VOXY_PACK_AO_LOCATION
+    voxyPackAO = vec4(float(face | (uint(modelIsShaded(model))<<6)) / 255.0, 0.0, 0.0, 1.0);
+    #endif
 
     #endif
 }

@@ -73,9 +73,12 @@ public final class VkShaderPipeline {
     public static final class GfxDesc {
         public String name;
         public String vertGlsl, fragGlsl;
+        public ByteBuffer fragSpirv;      //already compiled fragment stage, used instead of fragGlsl when set
         public int pushConstantBytes;
         public List<Binding> bindings = new ArrayList<>();
         public int colorFormat;           //VK_FORMAT_UNDEFINED for depth-only
+        public int[] colorFormats;        //several colour attachments, overrides colorFormat when set
+        public int[][] attachmentBlend;   //per attachment {srcColor, dstColor, srcAlpha, dstAlpha}, null entry = off; overrides blend when set
         public int depthFormat;           //VK_FORMAT_UNDEFINED for no depth attachment
         public int stencilFormat;         //VK_FORMAT_UNDEFINED unless depth-stencil has stencil
         public boolean depthTest = true, depthWrite = true;
@@ -103,7 +106,7 @@ public final class VkShaderPipeline {
         var vctx = ctx.vk();
         try (MemoryStack stack = stackPush()) {
             long vertModule = createModule(vctx, ShadercCompiler.compile(d.vertGlsl, ShaderType.VERTEX, d.name + ".vert"), stack);
-            long fragModule = createModule(vctx, ShadercCompiler.compile(d.fragGlsl, ShaderType.FRAGMENT, d.name + ".frag"), stack);
+            long fragModule = createModule(vctx, d.fragSpirv != null ? d.fragSpirv : ShadercCompiler.compile(d.fragGlsl, ShaderType.FRAGMENT, d.name + ".frag"), stack);
             this.modules = new long[]{vertModule, fragModule};
             this.descriptorSetLayout = createSetLayout(vctx, stack, d.bindings, this.pushStages);
             this.pipelineLayout = createPipelineLayout(vctx, stack, this.descriptorSetLayout, d.pushConstantBytes, this.pushStages);
@@ -145,27 +148,39 @@ public final class VkShaderPipeline {
                 depthState.back(depthState.front());
             }
 
-            var blendAttach = VkPipelineColorBlendAttachmentState.calloc(1, stack)
-                    .colorWriteMask(d.colorWrite ? 0xF : 0)
-                    .blendEnable(d.blend);
-            if (d.blend) {
-                blendAttach.srcColorBlendFactor(VK_BLEND_FACTOR_SRC_ALPHA)
-                        .dstColorBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
-                        .colorBlendOp(VK_BLEND_OP_ADD)
-                        .srcAlphaBlendFactor(VK_BLEND_FACTOR_ONE)
-                        .dstAlphaBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
-                        .alphaBlendOp(VK_BLEND_OP_ADD);
+            int[] formats = d.colorFormats != null ? d.colorFormats
+                    : (d.colorFormat != VK_FORMAT_UNDEFINED ? new int[]{d.colorFormat} : new int[0]);
+            var blendAttach = VkPipelineColorBlendAttachmentState.calloc(Math.max(1, formats.length), stack);
+            for (int i = 0; i < formats.length; i++) {
+                var attach = blendAttach.get(i).colorWriteMask(d.colorWrite ? 0xF : 0);
+                int[] factors = null;
+                if (d.attachmentBlend != null) {
+                    factors = i < d.attachmentBlend.length ? d.attachmentBlend[i] : null;
+                } else if (d.blend) {
+                    factors = new int[]{VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                            VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA};
+                }
+                attach.blendEnable(factors != null);
+                if (factors != null) {
+                    attach.srcColorBlendFactor(factors[0])
+                            .dstColorBlendFactor(factors[1])
+                            .colorBlendOp(VK_BLEND_OP_ADD)
+                            .srcAlphaBlendFactor(factors[2])
+                            .dstAlphaBlendFactor(factors[3])
+                            .alphaBlendOp(VK_BLEND_OP_ADD);
+                }
             }
             var blend = VkPipelineColorBlendStateCreateInfo.calloc(stack).sType$Default();
-            if (d.colorFormat != VK_FORMAT_UNDEFINED) {
+            if (formats.length != 0) {
+                blendAttach.limit(formats.length);
                 blend.pAttachments(blendAttach);
             }
 
             var rendering = VkPipelineRenderingCreateInfoKHR.calloc(stack).sType$Default()
                     .depthAttachmentFormat(d.depthFormat)
                     .stencilAttachmentFormat(d.stencilFormat);
-            if (d.colorFormat != VK_FORMAT_UNDEFINED) {
-                rendering.colorAttachmentCount(1).pColorAttachmentFormats(stack.ints(d.colorFormat));
+            if (formats.length != 0) {
+                rendering.colorAttachmentCount(formats.length).pColorAttachmentFormats(stack.ints(formats));
             }
 
             var gpci = VkGraphicsPipelineCreateInfo.calloc(1, stack).sType$Default()

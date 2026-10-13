@@ -2,6 +2,8 @@ package me.cortex.voxy.client.core.vk;
 
 import me.cortex.voxy.client.core.gl.shader.ShaderType;
 
+import org.lwjgl.system.MemoryUtil;
+
 import java.nio.ByteBuffer;
 
 import static org.lwjgl.util.shaderc.Shaderc.*;
@@ -27,7 +29,19 @@ public final class ShadercCompiler {
                 case COMPUTE -> shaderc_compute_shader;
                 default -> throw new IllegalArgumentException("Unsupported stage for VK: " + type);
             };
-            long result = shaderc_compile_into_spv(compiler, source, kind, name, "main", options);
+            //The source goes through the heap, not the MemoryStack the String overload encodes into:
+            // a shaderpack's LOD program is a few hundred kilobytes once its includes are expanded
+            ByteBuffer sourceText = MemoryUtil.memUTF8(source, false);
+            ByteBuffer fileName = MemoryUtil.memUTF8(name);
+            ByteBuffer entryPoint = MemoryUtil.memUTF8("main");
+            long result;
+            try {
+                result = shaderc_compile_into_spv(compiler, sourceText, kind, fileName, entryPoint, options);
+            } finally {
+                MemoryUtil.memFree(sourceText);
+                MemoryUtil.memFree(fileName);
+                MemoryUtil.memFree(entryPoint);
+            }
             try {
                 if (shaderc_result_get_compilation_status(result) != shaderc_compilation_status_success) {
                     throw new IllegalStateException("SPIR-V compile failed for " + name + ":\n"

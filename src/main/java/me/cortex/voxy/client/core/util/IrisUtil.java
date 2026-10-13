@@ -1,5 +1,6 @@
 package me.cortex.voxy.client.core.util;
 
+import me.cortex.voxy.client.compat.vitrail.VitrailVkCompat;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.rendering.Viewport;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
@@ -42,8 +43,10 @@ public class IrisUtil {
         }
     }
 
+    //True while ANY shadow-map stage is being walked/drawn (Iris's, or Vitrail's), i.e. when Sodium's
+    // visibility collectors and chunk draws are NOT describing the camera's view.
     public static boolean irisShadowActive() {
-        return IRIS_INSTALLED && irisShadowActive0();
+        return (IRIS_INSTALLED && irisShadowActive0()) || VitrailVkCompat.isShadowStageActive();
     }
 
     public static <T> T runWithoutVertexFormatExtension(Supplier<T> action) {

@@ -50,6 +50,13 @@ out gl_PerVertex {
 layout(location = 7) out flat uint quadDebug;
 #endif
 
+#ifdef VOXY_SMOOTH_LIGHT
+//Shaderpack LOD programs: where on its face plane the fragment is, so the light can be blended
+// between neighbouring blocks (see voxySmoothLight in quads.frag)
+layout(location = 2) out vec3 voxyPos;
+layout(location = 3) out flat vec2 voxyPlane;//lod scale, the face plane's offset along its axis
+#endif
+
 vec2 taaShift();
 
 //TODO: add a mechanism so that some quads can ignore backface culling
@@ -75,6 +82,11 @@ void main() {
 
     #ifndef USE_NV_BARRY
     uv = getCornerUV(quad, cornerId);
+    #endif
+
+    #ifdef VOXY_SMOOTH_LIGHT
+    voxyPos = quadCornerPoint;
+    voxyPlane = vec2(quad.lodScale, quad.axis == 0u ? quadCornerPoint.y : (quad.axis == 1u ? quadCornerPoint.z : quadCornerPoint.x));
     #endif
 
     //Note: other data is automatically discarded as it is undefiend and has not been generated

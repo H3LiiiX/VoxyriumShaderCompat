@@ -1,6 +1,12 @@
 package me.cortex.voxy.client.core.vk.render;
 
+import com.mojang.renderpearl.api.textures.GpuTextureView;
+import me.cortex.voxy.client.compat.vitrail.VitrailVoxyPack;
+import me.cortex.voxy.client.compat.vitrail.VoxyPackPatch;
+import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.RenderProperties;
+import me.cortex.voxy.client.core.gl.shader.ShaderType;
+import me.cortex.voxy.client.core.vk.ShadercCompiler;
 import me.cortex.voxy.client.core.rendering.util.SharedIndexBuffer;
 import me.cortex.voxy.client.core.vk.VkBuffer;
 import me.cortex.voxy.client.core.vk.VkCmd;
@@ -19,7 +25,9 @@ import org.lwjgl.vulkan.VkRect2D;
 import org.lwjgl.vulkan.VkRenderingAttachmentInfoKHR;
 import org.lwjgl.vulkan.VkRenderingInfoKHR;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.KHRDynamicRendering.vkCmdBeginRenderingKHR;
@@ -74,6 +82,26 @@ public class VkTerrainRenderer {
     private VkShaderPipeline terrainTranslucent;
     private int pipelineColorFormat = -1, pipelineDepthFormat = -1;
 
+    //Shaderpack LOD programs (see VitrailVoxyPack): the pack's voxy_opaque / voxy_translucent compiled
+    // into quads.frag, drawn into the pack-mode targets of the viewport. Null outside that mode.
+    private VoxyPackPatch pack;
+    private VkShaderPipeline packOpaque;
+    private VkShaderPipeline packTranslucent;//null when the pack has no translucent program
+    private List<VoxyPackPatch.Sampler> packOpaqueSamplers = List.of();
+    private List<VoxyPackPatch.Sampler> packTranslucentSamplers = List.of();
+    private int packDepthFormat = -1;
+    private VkShaderPipeline packDepthPipeline;
+    private VkShaderPipeline packLightPrepass;
+    private final long packWaterSampler;
+    private final VkBuffer packFrameUbo;
+    private final VkBuffer packUniformUbo;
+    private final VkBuffer packDepthParams;
+    private final long packNearestSampler;
+    private final long[] packSamplers = new long[4];//[linear ? 1 : 0 | repeat ? 2 : 0], what the pack asked for a texture
+    private final Matrix4f packModelViewPrev = new Matrix4f();
+    private final Matrix4f packProjPrev = new Matrix4f();
+    private boolean packHasPrev = false;
+
     public VkTerrainRenderer(VkFrameCtx ctx, VkUploadStream uploadStream, VkDownloadStream downloadStream,
                              RenderProperties properties, VkSectionGeometryData geometry, VkModelStore modelStore) {
         this.ctx = ctx;
@@ -99,6 +127,14 @@ public class VkTerrainRenderer {
         }
         this.depthBoundSampler = VkImage2D.createSampler(ctx.vk(), false, false);
         this.lightmapSampler = VkImage2D.createSampler(ctx.vk(), false, true);
+        this.packFrameUbo = new VkBuffer(ctx, VoxyPackPatch.FRAME_BLOCK_BYTES).zero();
+        this.packUniformUbo = new VkBuffer(ctx, PACK_UNIFORM_BYTES).zero();
+        this.packDepthParams = new VkBuffer(ctx, 128).zero();
+        this.packNearestSampler = VkImage2D.createSampler(ctx.vk(), false, false);
+        for (int i = 0; i < 4; i++) {
+            this.packSamplers[i] = createPackSampler(ctx, (i & 1) != 0, (i & 2) != 0);
+        }
+        this.packWaterSampler = VkImage2D.createSampler(ctx.vk(), true, false);//nearest, every mip like the block atlas
 
         //================= compute pipelines =================
         this.prep = new VkShaderPipeline(ctx, "prep.comp",
@@ -209,6 +245,450 @@ public class VkTerrainRenderer {
         this.pipelineDepthFormat = df;
     }
 
+    //=============================== shaderpack LOD programs ===============================
+
+    private static final int PACK_UNIFORM_BYTES = VoxyPackPatch.MAX_PACK_UNIFORM_BYTES;
+
+    private static long createPackSampler(VkFrameCtx ctx, boolean linear, boolean repeat) {
+        try (MemoryStack stack = stackPush()) {
+            int filter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+            int address = repeat ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            var sci = org.lwjgl.vulkan.VkSamplerCreateInfo.calloc(stack).sType$Default()
+                    .magFilter(filter).minFilter(filter)
+                    .mipmapMode(linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST)
+                    .addressModeU(address)
+                    .addressModeV(address)
+                    .addressModeW(address)
+                    .minLod(0).maxLod(VK_LOD_CLAMP_NONE);
+            var pSampler = stack.mallocLong(1);
+            if (vkCreateSampler(ctx.vk().device, sci, null, pSampler) != VK_SUCCESS) {
+                throw new IllegalStateException("vkCreateSampler(pack)");
+            }
+            return pSampler.get(0);
+        }
+    }
+
+    /**
+     * Makes {@code patch} the program the LODs are drawn with, building its pipelines the first time.
+     * Returns false (and leaves pack mode) when there is no patch or it cannot be built, in which case
+     * the LODs are drawn with Voxy's own vanilla-lit shaders.
+     */
+    public boolean preparePack(VoxyPackPatch patch, int depthFormat) {
+        if (patch == null) {
+            this.freePack();
+            return false;
+        }
+        if (patch == this.pack && this.packOpaque != null && depthFormat == this.packDepthFormat) {
+            return true;
+        }
+        this.freePack();
+        try {
+            this.buildPack(patch, depthFormat);
+            this.pack = patch;
+            this.packDepthFormat = depthFormat;
+            this.packHasPrev = false;
+            return true;
+        } catch (Throwable t) {
+            this.freePack();
+            VitrailVoxyPack.markFailed(patch, t);
+            return false;
+        }
+    }
+
+    private void buildPack(VoxyPackPatch patch, int depthFormat) {
+        {
+            var d = new VkShaderPipeline.GfxDesc();
+            d.name = "pack-depth";
+            d.vertGlsl = VkShaderSource.load("voxy:post/fullscreen2.vert", VkShaderSource.defs().props(this.properties).build());
+            d.fragGlsl = VkShaderSource.load("voxy:post/pack_depth.frag", VkShaderSource.defs().props(this.properties).build());
+            d.pushConstantBytes = 8;
+            d.colorFormat = VK_FORMAT_R32_SFLOAT;
+            d.depthFormat = VK_FORMAT_UNDEFINED;
+            d.stencilFormat = VK_FORMAT_UNDEFINED;
+            d.depthTest = false;
+            d.depthWrite = false;
+            d.blend = false;
+            d.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+            d.bindings = List.of(VkShaderPipeline.sampler(0), VkShaderPipeline.sampler(1), VkShaderPipeline.ubo(2));
+            this.packDepthPipeline = new VkShaderPipeline(this.ctx, d);
+        }
+        var vert = VkShaderSource.load("voxy:lod/gl46/quads3.vert", VkShaderSource.defs().props(this.properties)
+                .def("PATCHED_SHADER")
+                .def("VOXY_SMOOTH_LIGHT")
+                .build());
+
+        {//light prepass: the same geometry and the same vertex stage, so the depth it leaves is exactly the
+            // depth the lit pass then draws at
+            var d = new VkShaderPipeline.GfxDesc();
+            d.name = "terrain-pack-light";
+            d.vertGlsl = vert;
+            d.fragGlsl = VkShaderSource.load("voxy:lod/gl46/quads.frag", VkShaderSource.defs().props(this.properties)
+                    .defIf("VOXY_VULKAN_SAMPLE_MASK_DISCARD", this.ctx.vk().needsSampleMaskDiscard)
+                    .def("PATCHED_SHADER")
+                    .def("VOXY_SMOOTH_LIGHT")
+                    .def("VOXY_LIGHT_PREPASS")
+                    .build());
+            d.colorFormat = VkViewport.PACK_LIGHT_FORMAT;
+            d.depthFormat = depthFormat;
+            d.stencilFormat = depthFormat;
+            d.depthTest = true;
+            d.depthWrite = true;
+            d.depthCompare = VkCmd.closerEqual(this.properties);
+            d.blend = false;
+            d.stencilTestEqual1 = true;
+            d.bindings = List.of(VkShaderPipeline.ubo(0), VkShaderPipeline.ssbo(1), VkShaderPipeline.ssbo(3),
+                    VkShaderPipeline.ssbo(4), VkShaderPipeline.ssbo(5),
+                    VkShaderPipeline.sampler(8), VkShaderPipeline.sampler(9), VkShaderPipeline.sampler(10));
+            this.packLightPrepass = new VkShaderPipeline(this.ctx, d);
+        }
+
+        int[] dataTargets = patch.opaqueDataTargets();
+        int[] opaqueFormats = new int[2 + dataTargets.length];
+        opaqueFormats[0] = VkViewport.PACK_COLOUR_FORMAT;
+        for (int i = 0; i < dataTargets.length; i++) {
+            opaqueFormats[1 + i] = VkViewport.PACK_DATA_FORMAT;
+        }
+        //After the pack's draw buffers: the face / AO flag for Voxy's SSAO
+        opaqueFormats[1 + dataTargets.length] = VkViewport.PACK_META_FORMAT;
+
+        {
+            String frag = VkShaderSource.load("voxy:lod/gl46/quads.frag", VkShaderSource.defs().props(this.properties)
+                    .defIf("VOXY_VULKAN_SAMPLE_MASK_DISCARD", this.ctx.vk().needsSampleMaskDiscard)
+                    .def("PATCHED_SHADER")
+                    .def("VOXY_SMOOTH_LIGHT")
+                    .def("VOXY_PACK_AO_LOCATION", 1 + dataTargets.length)
+                    .build()) + patch.opaqueFragmentTail();
+            var spirv = ShadercCompiler.compile(frag, ShaderType.FRAGMENT, "terrain-pack-opaque.frag");
+            this.packOpaqueSamplers = usedSamplers(patch, spirv);
+
+            var d = new VkShaderPipeline.GfxDesc();
+            d.name = "terrain-pack-opaque";
+            d.vertGlsl = vert;
+            d.fragSpirv = spirv;
+            d.colorFormats = opaqueFormats;
+            d.depthFormat = depthFormat;
+            d.stencilFormat = depthFormat;
+            d.depthTest = true;
+            d.depthWrite = true;
+            d.depthCompare = VkCmd.closerEqual(this.properties);
+            d.blend = false;
+            d.stencilTestEqual1 = true;
+            var bindings = packBindings(this.packOpaqueSamplers);
+            bindings.add(VkShaderPipeline.sampler(6));//the light prepass
+            d.bindings = bindings;
+            this.packOpaque = new VkShaderPipeline(this.ctx, d);
+        }
+
+        if (patch.hasTranslucent()) {
+            String frag = VkShaderSource.load("voxy:lod/gl46/quads.frag", VkShaderSource.defs().props(this.properties)
+                    .defIf("VOXY_VULKAN_SAMPLE_MASK_DISCARD", this.ctx.vk().needsSampleMaskDiscard)
+                    .def("PATCHED_SHADER")
+                    .def("TRANSLUCENT")
+                    .def("PACK_ANIMATED_WATER")
+                    .def("VOXY_TRANSLUCENT_AFTER_DEFERRED")//drawn by renderDeferredTranslucent
+                    .build()) + patch.translucentFragmentTail();
+            var spirv = ShadercCompiler.compile(frag, ShaderType.FRAGMENT, "terrain-pack-translucent.frag");
+            this.packTranslucentSamplers = usedSamplers(patch, spirv);
+
+            var blend = patch.translucentBlend();
+            var d = new VkShaderPipeline.GfxDesc();
+            d.name = "terrain-pack-translucent";
+            d.vertGlsl = vert;
+            d.fragSpirv = spirv;
+            d.colorFormats = new int[]{VkViewport.PACK_COLOUR_FORMAT};
+            d.attachmentBlend = new int[][]{blend == null ? null
+                    : new int[]{blend.srcColor(), blend.dstColor(), blend.srcAlpha(), blend.dstAlpha()}};
+            d.depthFormat = depthFormat;
+            d.stencilFormat = depthFormat;
+            d.depthTest = true;
+            d.depthWrite = true;
+            d.depthCompare = VkCmd.closerEqual(this.properties);
+            d.stencilTestEqual1 = true;
+            var bindings = packBindings(this.packTranslucentSamplers);
+            bindings.add(VkShaderPipeline.sampler(7));//Minecraft's block atlas, for the water sprite
+            d.bindings = bindings;
+            d.pushConstantBytes = 16;
+            this.packTranslucent = new VkShaderPipeline(this.ctx, d);
+        }
+    }
+
+    //Only what the compiled program actually reads gets a descriptor: a pack lists names that only
+    // exist under Iris (shadow maps behind options, buffers only its Voxy deferred writes)
+    private static List<VoxyPackPatch.Sampler> usedSamplers(VoxyPackPatch patch, java.nio.ByteBuffer spirv) {
+        Set<String> loaded = VoxyPackPatch.loadedVariableNames(spirv);
+        List<VoxyPackPatch.Sampler> used = new ArrayList<>();
+        for (var sampler : patch.samplers()) {
+            if (!loaded.contains(sampler.name())) continue;
+            if (!sampler.type().equals("sampler2D")) {
+                throw new IllegalStateException("the LOD programs read " + sampler.name() + " as a " + sampler.type()
+                        + ", which is not served on Vulkan");
+            }
+            used.add(sampler);
+        }
+        return List.copyOf(used);
+    }
+
+    private static ArrayList<VkShaderPipeline.Binding> packBindings(List<VoxyPackPatch.Sampler> samplers) {
+        var bindings = new ArrayList<>(List.of(VkShaderPipeline.ubo(0), VkShaderPipeline.ssbo(1), VkShaderPipeline.ssbo(3),
+                VkShaderPipeline.ssbo(4), VkShaderPipeline.ssbo(5),
+                VkShaderPipeline.sampler(8), VkShaderPipeline.sampler(9), VkShaderPipeline.sampler(10),
+                VkShaderPipeline.ubo(VoxyPackPatch.FRAME_UBO_BINDING), VkShaderPipeline.ubo(VoxyPackPatch.PACK_UBO_BINDING)));
+        for (var sampler : samplers) {
+            bindings.add(VkShaderPipeline.sampler(sampler.binding()));
+        }
+        return bindings;
+    }
+
+    private void freePack() {
+        if (this.packOpaque != null || this.packTranslucent != null || this.packDepthPipeline != null
+                || this.packLightPrepass != null) {
+            //Frames still in flight may be drawing with them (this only happens on a pack/setting change)
+            vkDeviceWaitIdle(this.ctx.vk().device);
+        }
+        if (this.packOpaque != null) this.packOpaque.free();
+        if (this.packTranslucent != null) this.packTranslucent.free();
+        if (this.packDepthPipeline != null) this.packDepthPipeline.free();
+        if (this.packLightPrepass != null) this.packLightPrepass.free();
+        this.packLightPrepass = null;
+        this.packOpaque = null;
+        this.packTranslucent = null;
+        this.packDepthPipeline = null;
+        this.pack = null;
+        this.packOpaqueSamplers = List.of();
+        this.packTranslucentSamplers = List.of();
+    }
+
+    private final Matrix4f packScratch = new Matrix4f();
+
+    //The two blocks the pack's programs read: Voxy's own volume (the vx* names, the pack's view size,
+    // and how to turn this backend's depth into the OpenGL one the pack expects), and every other
+    // uniform the pack listed, answered by Vitrail exactly as its own programs are answered
+    private void uploadPackUniforms(VkViewport viewport) {
+        long ptr = this.uploadStream.upload(this.packFrameUbo, 0, VoxyPackPatch.FRAME_BLOCK_BYTES);
+        var proj = toPackDepth(viewport.projection, this.packScratch);
+        if (!this.packHasPrev) {
+            this.packModelViewPrev.set(viewport.modelView);
+            this.packProjPrev.set(proj);
+            this.packHasPrev = true;
+        }
+        viewport.modelView.getToAddress(ptr);
+        new Matrix4f(viewport.modelView).invert().getToAddress(ptr + 64);
+        this.packModelViewPrev.getToAddress(ptr + 128);
+        proj.getToAddress(ptr + 192);
+        new Matrix4f(proj).invert().getToAddress(ptr + 256);
+        this.packProjPrev.getToAddress(ptr + 320);
+        //voxy_depthConv: the window depth the pack expects is a * gl_FragCoord.z + b
+        boolean reverse = this.properties.isReverseZ();
+        MemoryUtil.memPutFloat(ptr + 384, reverse ? -1.0f : 1.0f);
+        MemoryUtil.memPutFloat(ptr + 388, reverse ? 1.0f : 0.0f);
+        MemoryUtil.memPutFloat(ptr + 392, 0);
+        MemoryUtil.memPutFloat(ptr + 396, 0);
+        MemoryUtil.memPutFloat(ptr + 400, viewport.width);
+        MemoryUtil.memPutFloat(ptr + 404, viewport.height);
+        MemoryUtil.memPutInt(ptr + 408, Math.round(VoxyConfig.CONFIG.sectionRenderDistance * 32));
+        MemoryUtil.memPutInt(ptr + 412, 0);
+
+        //Next frame's "previous" pair
+        this.packModelViewPrev.set(viewport.modelView);
+        this.packProjPrev.set(proj);
+
+        long packPtr = this.uploadStream.upload(this.packUniformUbo, 0, PACK_UNIFORM_BYTES);
+        VitrailVoxyPack.writeUniforms(packPtr);//sized against PACK_UNIFORM_BYTES when the pack was read
+        this.uploadStream.commit();
+    }
+
+    //The projection Voxy rasterises with, reversed Z over zero to one on this backend, in the OpenGL
+    // form (z from -1 to 1, near at -1) a pack is written against: the z row becomes w - 2z (or 2z - w
+    // for a forward depth), which is the same conversion Vitrail hands the pack's own programs
+    private Matrix4f toPackDepth(Matrix4f projection, Matrix4f dest) {
+        dest.set(projection);
+        float sign = this.properties.isReverseZ() ? -2.0f : 2.0f;
+        float wSign = this.properties.isReverseZ() ? 1.0f : -1.0f;
+        if (this.properties.isZero2One()) {
+            dest.m02(wSign * projection.m03() + sign * projection.m02());
+            dest.m12(wSign * projection.m13() + sign * projection.m12());
+            dest.m22(wSign * projection.m23() + sign * projection.m22());
+            dest.m32(wSign * projection.m33() + sign * projection.m32());
+        } else if (this.properties.isReverseZ()) {
+            dest.m02(-projection.m02());
+            dest.m12(-projection.m12());
+            dest.m22(-projection.m22());
+            dest.m32(-projection.m32());
+        }
+        return dest;
+    }
+
+    private void bindPackSamplers(VkShaderPipeline.Binder b, List<VoxyPackPatch.Sampler> samplers) {
+        b.ubo(VoxyPackPatch.FRAME_UBO_BINDING, this.packFrameUbo)
+                .ubo(VoxyPackPatch.PACK_UBO_BINDING, this.packUniformUbo);
+        GpuTextureView white = VitrailVoxyPack.white();
+        for (var sampler : samplers) {
+            String name = sampler.name();
+            if (name.equals("tex")) {
+                //Nothing of an LOD's texture is the pack's: Voxy's own atlas is the closest stand-in
+                b.sampler(sampler.binding(), this.modelStore.atlas.view, this.modelStore.atlasSampler,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                continue;
+            }
+            if (name.startsWith("vxDepthTex") && this.packDepthView != 0) {
+                //What the opaque LODs (and the vanilla terrain under them) left, converted by buildPackDepth.
+                // The translucent depth is never read by the LOD programs themselves.
+                b.sampler(sampler.binding(), this.packDepthView, this.packNearestSampler,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                continue;
+            }
+            var sampled = VitrailVoxyPack.sampler(name);
+            GpuTextureView view = sampled == null ? white : sampled.view();
+            long vkSampler = sampled == null ? this.packNearestSampler
+                    : this.packSamplers[(sampled.linear() ? 1 : 0) | (sampled.repeat() ? 2 : 0)];
+            //Minecraft's Vulkan backend keeps every image it owns in GENERAL
+            b.sampler(sampler.binding(), VkFrameHost.vkView(view), vkSampler, VK_IMAGE_LAYOUT_GENERAL);
+        }
+    }
+
+    private long packDepthView = 0;
+
+    /**
+     * Shaderpack LOD mode: converts the opaque depth (offscreen depth must be in shader-read layout)
+     * into viewport.packDepth, which the translucent LOD programs read as vxDepthTexOpaque for the
+     * water's depth fog and its reflections. Recorded between the opaque and translucent passes.
+     */
+    public void buildPackDepth(VkViewport viewport, VkCompositor.VkViewportRT rt) {
+        this.packDepthView = 0;
+        if (this.pack == null || viewport.packDepth == null) return;
+        var cmd = this.ctx.cmd();
+        {
+            long ptr = this.uploadStream.upload(this.packDepthParams, 0, 128);
+            new Matrix4f(viewport.vanillaProjection).invert().getToAddress(ptr);
+            toPackDepth(viewport.projection, new Matrix4f()).getToAddress(ptr + 64);
+            this.uploadStream.commit();
+        }
+        //Minecraft's depth, read where the vanilla terrain covers the pixel
+        VkFrameHost.transitionMcImage(cmd, rt.mcDepth(), true,
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        viewport.packDepth.transition(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        try (MemoryStack stack = stackPush()) {
+            var attach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
+                    .imageView(viewport.packDepth.view)
+                    .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                    .loadOp(VK_ATTACHMENT_LOAD_OP_DONT_CARE)
+                    .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+            var info = VkRenderingInfoKHR.calloc(stack).sType$Default()
+                    .renderArea(VkRect2D.calloc(stack).extent(e -> e.width(viewport.width).height(viewport.height)))
+                    .layerCount(1)
+                    .pColorAttachments(attach);
+            vkCmdBeginRenderingKHR(cmd, info);
+            this.packDepthPipeline.bind(cmd);
+            VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
+            try (var b = this.packDepthPipeline.binder()) {
+                b.sampler(0, viewport.depthSampleView, this.packNearestSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                        .sampler(1, VkFrameHost.vkView(rt.mcDepth()), this.packNearestSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                        .ubo(2, this.packDepthParams)
+                        .push(cmd);
+            }
+            var pc = stack.malloc(8);
+            boolean reverse = this.properties.isReverseZ();
+            pc.putFloat(0, reverse ? -1.0f : 1.0f);
+            pc.putFloat(4, reverse ? 1.0f : 0.0f);
+            this.packDepthPipeline.pushConstants(cmd, pc);
+            vkCmdDraw(cmd, 4, 1, 0, 0);
+            vkCmdEndRenderingKHR(cmd);
+        }
+        VkFrameHost.transitionMcImage(cmd, rt.mcDepth(), true,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        viewport.packDepth.transition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+        this.packDepthView = viewport.packDepth.view;
+    }
+
+    private static final net.minecraft.resources.Identifier WATER_STILL =
+            net.minecraft.resources.Identifier.fromNamespaceAndPath("minecraft", "block/water_still");
+
+    //Minecraft's block atlas and the water sprite's corners in it, for PACK_ANIMATED_WATER
+    private void bindWater(VkShaderPipeline pipeline, VkShaderPipeline.Binder b, VkCommandBuffer cmd) {
+        var atlas = (net.minecraft.client.renderer.texture.TextureAtlas) net.minecraft.client.Minecraft.getInstance()
+                .getTextureManager().getTexture(net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_BLOCKS);
+        var sprite = atlas.getSprite(WATER_STILL);
+        b.sampler(7, VkFrameHost.vkView(atlas.getTextureView()), this.packWaterSampler, VK_IMAGE_LAYOUT_GENERAL);
+        try (MemoryStack stack = stackPush()) {
+            var pc = stack.malloc(16);
+            pc.putFloat(0, sprite.getU0()).putFloat(4, sprite.getV0()).putFloat(8, sprite.getU1()).putFloat(12, sprite.getV1());
+            pipeline.pushConstants(cmd, pc);
+        }
+    }
+
+    //The light (and face plane) of every visible opaque LOD pixel, into viewport.packLight, which the lit
+    // pass right after reads to blend the light between neighbouring blocks. It also lays down the depth,
+    // so the lit pass only ever shades the visible surface
+    private void renderLightPrepass(VkViewport viewport, int maxDraw) {
+        var cmd = this.ctx.cmd();
+        viewport.packLight.transition(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        try (MemoryStack stack = stackPush()) {
+            var attach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
+                    .imageView(viewport.packLight.view)
+                    .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                    .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
+                    .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+            //face -1: no LOD here, which no fragment's face matches
+            attach.clearValue().color().float32(0, 0).float32(1, 0).float32(2, -1).float32(3, 0);
+            var info = VkRenderingInfoKHR.calloc(stack).sType$Default()
+                    .renderArea(VkRect2D.calloc(stack).extent(e -> e.width(viewport.width).height(viewport.height)))
+                    .layerCount(1)
+                    .pColorAttachments(attach);
+            vkCmdBeginRenderingKHR(cmd, info);
+            vkCmdEndRenderingKHR(cmd);
+        }
+        this.renderTerrain(viewport, new long[]{viewport.packLight.view}, this.packLightPrepass, null, 0, 4 * 3, maxDraw, false);
+        viewport.packLight.transition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+    }
+
+    /** Whether the LOD translucents are the pack's, drawn after its deferred stage (renderDeferredTranslucent). */
+    public boolean hasPackTranslucent() {
+        return this.pack != null && this.packTranslucent != null;
+    }
+
+    /**
+     * Shaderpack LOD mode: the LOD translucents, drawn where the real water is, after the pack's
+     * deferred stage, into the cleared SSAO target (the opaque LODs were composited from it already).
+     * The offscreen depth must be in attachment layout.
+     */
+    public void renderDeferredTranslucent(VkViewport viewport) {
+        var cmd = this.ctx.cmd();
+        viewport.colourSSAO.transition(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        try (MemoryStack stack = stackPush()) {
+            var attach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
+                    .imageView(viewport.colourSSAO.view)
+                    .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                    .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
+                    .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+            attach.clearValue().color().float32(0, 0).float32(1, 0).float32(2, 0).float32(3, 0);
+            var info = VkRenderingInfoKHR.calloc(stack).sType$Default()
+                    .renderArea(VkRect2D.calloc(stack).extent(e -> e.width(viewport.width).height(viewport.height)))
+                    .layerCount(1)
+                    .pColorAttachments(attach);
+            vkCmdBeginRenderingKHR(cmd, info);
+            vkCmdEndRenderingKHR(cmd);
+        }
+        if (!this.hasPackTranslucent() || this.geometry.getSectionCount() == 0) return;
+        int cap = Math.min(this.geometry.getSectionCount(), VkViewport.TRANSLUCENT_DRAW_COUNT);
+        int maxDraw = this.fixedCountBudget(this.fbTranslucentDraws, 256, cap);
+        this.renderTerrain(viewport, new long[]{viewport.colourSSAO.view}, this.packTranslucent, this.packTranslucentSamplers,
+                TRANSLUCENT_OFFSET * 5L * 4, 4 * 4, maxDraw, false);
+    }
+
+    public boolean isPackActive() {
+        return this.pack != null;
+    }
+
     //==================================================================================
 
     private final Matrix4f uniformScratch = new Matrix4f();
@@ -223,7 +703,8 @@ public class VkTerrainRenderer {
             viewport.frameId &= 0x7fffffff;
         }
         MemoryUtil.memPutInt(ptr, viewport.frameId & 0x7fffffff); ptr += 4;
-        viewport.innerTranslation.getToAddress(ptr);
+        viewport.innerTranslation.getToAddress(ptr); ptr += 4 * 3;
+        MemoryUtil.memPutFloat(ptr, me.cortex.voxy.client.core.rendering.FluidSurface.relativeSurfaceY(viewport.section.y));
         this.uploadStream.commit();
     }
 
@@ -279,7 +760,7 @@ public class VkTerrainRenderer {
         }
 
         {//raster occlusion test into the visibility buffer (depth-tested box draw, no writes)
-            this.beginRendering(cmd, viewport, 0L, true);//depth-only
+            this.beginRendering(cmd, viewport, new long[0], true);//depth-only
             this.cullRaster.bind(cmd);
             VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
             try (var b = this.cullRaster.binder()) {
@@ -402,9 +883,21 @@ public class VkTerrainRenderer {
         this.ensureTerrainPipelines(viewport);
         if (this.geometry.getSectionCount() == 0) return;
         this.uploadUniform(viewport);
+        if (this.pack != null) {
+            this.uploadPackUniforms(viewport);
+            //The pack's targets were last written as attachments by Vitrail's passes (this frame's
+            // or the last one's); the LOD programs sample them
+            this.ctx.barrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+                            | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+        }
         int cap = Math.min((int) (this.geometry.getSectionCount() * 4.4 + 128), VkViewport.OPAQUE_DRAW_COUNT);
         int maxDraw = this.fixedCountBudget(this.fbOpaqueDraws, 1024, cap);
-        this.renderTerrain(viewport, viewport.colour.view, this.terrainOpaque, 0, 4 * 3, maxDraw, clearTargets);
+        if (this.pack != null) {
+            this.renderLightPrepass(viewport, maxDraw);
+        }
+        this.renderOpaqueTerrain(viewport, 0, 4 * 3, maxDraw, clearTargets);
     }
 
     public void renderTemporal(VkViewport viewport) {
@@ -412,7 +905,21 @@ public class VkTerrainRenderer {
         if (this.geometry.getSectionCount() == 0) return;
         int cap = Math.min(this.geometry.getSectionCount(), VkViewport.TEMPORAL_DRAW_COUNT);
         int maxDraw = this.fixedCountBudget(this.fbTemporalDraws, 256, cap);
-        this.renderTerrain(viewport, viewport.colour.view, this.terrainOpaque, TEMPORAL_OFFSET * 5L * 4, 4 * 5, maxDraw, false);
+        this.renderOpaqueTerrain(viewport, TEMPORAL_OFFSET * 5L * 4, 4 * 5, maxDraw, false);
+    }
+
+    private void renderOpaqueTerrain(VkViewport viewport, long indirectOffset, long drawCountOffset, int maxDraw, boolean clear) {
+        if (this.pack != null) {
+            long[] views = new long[2 + viewport.packData.length];
+            views[0] = viewport.colour.view;
+            for (int i = 0; i < viewport.packData.length; i++) {
+                views[1 + i] = viewport.packData[i].view;
+            }
+            views[1 + viewport.packData.length] = viewport.packMeta.view;
+            this.renderTerrain(viewport, views, this.packOpaque, this.packOpaqueSamplers, indirectOffset, drawCountOffset, maxDraw, clear);
+        } else {
+            this.renderTerrain(viewport, new long[]{viewport.colour.view}, this.terrainOpaque, null, indirectOffset, drawCountOffset, maxDraw, clear);
+        }
     }
 
     /** Translucents draw onto the SSAO output (mirrors the GL fbSSAO target). */
@@ -421,10 +928,15 @@ public class VkTerrainRenderer {
         if (this.geometry.getSectionCount() == 0) return;
         int cap = Math.min(this.geometry.getSectionCount(), VkViewport.TRANSLUCENT_DRAW_COUNT);
         int maxDraw = this.fixedCountBudget(this.fbTranslucentDraws, 256, cap);
-        this.renderTerrain(viewport, viewport.colourSSAO.view, this.terrainTranslucent, TRANSLUCENT_OFFSET * 5L * 4, 4 * 4, maxDraw, false);
+        if (this.pack != null && this.packTranslucent != null) {
+            this.renderTerrain(viewport, new long[]{viewport.colourSSAO.view}, this.packTranslucent, this.packTranslucentSamplers,
+                    TRANSLUCENT_OFFSET * 5L * 4, 4 * 4, maxDraw, false);
+            return;
+        }
+        this.renderTerrain(viewport, new long[]{viewport.colourSSAO.view}, this.terrainTranslucent, null, TRANSLUCENT_OFFSET * 5L * 4, 4 * 4, maxDraw, false);
     }
 
-    private void renderTerrain(VkViewport viewport, long colorView, VkShaderPipeline pipeline,
+    private void renderTerrain(VkViewport viewport, long[] colorViews, VkShaderPipeline pipeline, List<VoxyPackPatch.Sampler> packSamplers,
                                long indirectOffset, long drawCountOffset, int maxDrawCount, boolean clear) {
         var cmd = this.ctx.cmd();
         this.ctx.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -432,7 +944,7 @@ public class VkTerrainRenderer {
                 VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
                 VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDEX_READ_BIT);
 
-        this.beginRendering(cmd, viewport, colorView, !clear);//LOAD unless first pass (which cleared via compositor setup)
+        this.beginRendering(cmd, viewport, colorViews, !clear);//LOAD unless first pass (which cleared via compositor setup)
         pipeline.bind(cmd);
         VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
         long lightmapView = VkFrameHost.lightmapView();
@@ -444,8 +956,17 @@ public class VkTerrainRenderer {
                     .ssbo(5, viewport.positionScratchBuffer)
                     .sampler(8, this.modelStore.atlas.view, this.modelStore.atlasSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
                     .sampler(9, lightmapView, this.lightmapSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-                    .sampler(10, viewport.depthBoundSampleView, this.depthBoundSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-                    .push(cmd);
+                    .sampler(10, viewport.depthBoundSampleView, this.depthBoundSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            if (packSamplers != null) {
+                this.bindPackSamplers(b, packSamplers);
+            }
+            if (pipeline == this.packTranslucent) {
+                this.bindWater(pipeline, b, cmd);
+            }
+            if (pipeline == this.packOpaque) {
+                b.sampler(6, viewport.packLight.view, this.packNearestSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            }
+            b.push(cmd);
         }
         vkCmdBindIndexBuffer(cmd, this.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT16);
         if (this.ctx.vk().hasDrawIndirectCount) {
@@ -473,11 +994,12 @@ public class VkTerrainRenderer {
 
     /**
      * Begin dynamic rendering over the offscreen targets (always LOAD; clears
-     * happen in the depth-setup pass). {@code colorView} selects the colour
-     * attachment (main colour vs SSAO output); 0 = depth-only.
+     * happen in the depth-setup pass). {@code colorViews} are the colour
+     * attachments in output order (main colour vs SSAO output, plus the
+     * shaderpack's extra draw buffers); empty = depth-only.
      */
     private void beginRendering(VkCommandBuffer cmd, VkViewport viewport,
-                                long colorView, boolean load) {
+                                long[] colorViews, boolean load) {
         try (MemoryStack stack = stackPush()) {
             var depthAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
                     .imageView(viewport.depthStencil.view)
@@ -494,12 +1016,15 @@ public class VkTerrainRenderer {
                     .layerCount(1)
                     .pDepthAttachment(depthAttach)
                     .pStencilAttachment(stencilAttach);
-            if (colorView != 0L) {
-                var colorAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
-                        .imageView(colorView)
-                        .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-                        .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
-                        .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+            if (colorViews.length != 0) {
+                var colorAttach = VkRenderingAttachmentInfoKHR.calloc(colorViews.length, stack);
+                for (int i = 0; i < colorViews.length; i++) {
+                    colorAttach.get(i).sType$Default()
+                            .imageView(colorViews[i])
+                            .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                            .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
+                            .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+                }
                 info.pColorAttachments(colorAttach);
             }
             vkCmdBeginRenderingKHR(cmd, info);
@@ -516,6 +1041,13 @@ public class VkTerrainRenderer {
             this.terrainOpaque.free();
             this.terrainTranslucent.free();
         }
+        this.freePack();
+        for (long sampler : this.packSamplers) {
+            vkDestroySampler(this.ctx.vk().device, sampler, null);
+        }
+        this.packFrameUbo.free();
+        this.packUniformUbo.free();
+        this.packDepthParams.free();
         //depthBoundSampler/lightmapSampler come from VkImage2D.createSampler's
         // device-lifetime cache (shared handles); never destroy them per-object
         // (multi-free vkDestroySampler -> SIGSEGV on world unload).

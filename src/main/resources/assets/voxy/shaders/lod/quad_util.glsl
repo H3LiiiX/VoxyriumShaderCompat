@@ -156,6 +156,20 @@ void setupQuad(out QuadData quad, const in Quad rawQuad, uvec2 sPos, bool genera
     quad.lodScale = lodScale;
     quad.axis = face>>1;
     quad.basePoint = (quadStart*lodScale)+vec3(baseSection<<5);
+
+    //A coarser LOD keeps a voxel as fluid if any block in it is (air never wins the mip), so a sea's top
+    // face lands on the top of whichever voxel straddles the surface: up to a whole voxel above the real
+    // water, by a different amount on every level, which shows as a straight step where the LODs meet
+    // the real chunks. Pin those faces to the plane the real water stands on, the 8/9 height of a source
+    // block with air above it. Every comparison against a NaN fluidSurfaceY is false, which turns it off.
+    bool pinnedFluidTop = false;
+    if (isFluid && face == 1u) {
+        float voxelTop = quad.basePoint.y;//fluid tops have no indentation, so this is the voxel's top
+        if (voxelTop >= fluidSurfaceY && voxelTop - lodScale < fluidSurfaceY) {
+            quad.basePoint.y = fluidSurfaceY - (1.0/9.0);
+            pinnedFluidTop = true;
+        }
+    }
     #ifdef USE_SINGLE_TRI
     quad.quadSizeAddin = (geometryFaceSize.yw + (quadSize - 1)*2);
     quad.uvSizeAddin = (textureFaceSize.yw + (quadSize - 1)*2);
@@ -165,8 +179,12 @@ void setupQuad(out QuadData quad, const in Quad rawQuad, uvec2 sPos, bool genera
     #endif
     quad.uvCorner = textureFaceSize.xz;
     quad.face = face;
-    quad.fluidCornerHeights = isFluid ? extractFluidCornerHeights(rawQuad) : uint(-1);
+    //A pinned top is flat on the plane: the corner heights would lower it by a fraction of the voxel again
+    quad.fluidCornerHeights = isFluid && !pinnedFluidTop ? extractFluidCornerHeights(rawQuad) : uint(-1);
 }
+
+//The corner getQuadCornerPos last placed, before projection (VOXY_SMOOTH_LIGHT hands it on)
+vec3 quadCornerPoint;
 
 vec4 getQuadCornerPos(in QuadData quad, uint cornerId) {
     uvec2 cornerBits = uvec2((cornerId>>1)&1u, cornerId&1u);
@@ -196,6 +214,7 @@ vec4 getQuadCornerPos(in QuadData quad, uint cornerId) {
         }
     }
 
+    quadCornerPoint = point;
     vec4 pos = MVP * vec4(point, 1.0f);
     pos.xy += taaOffset*pos.w;
     return pos;

@@ -34,6 +34,9 @@ public class VkSSAO {
     private final boolean isBetterSSAO;
     private final int spp;
     private final VkShaderPipeline pipeline;
+    private VkShaderPipeline packPipeline;//shaderpack LOD mode variant (PACK_AO), built on first use
+    private final String packSource;
+    private final List<VkShaderPipeline.Binding> packBindings;
     private final VkBuffer params;
     private final long colourSampler;
     private final long depthSampler;
@@ -67,6 +70,15 @@ public class VkSSAO {
                 : List.of(VkShaderPipeline.image(0), VkShaderPipeline.sampler(1), VkShaderPipeline.sampler(2),
                         VkShaderPipeline.ubo(4));
         this.pipeline = new VkShaderPipeline(ctx, "ssao.comp", src, 0, bindings);
+
+        String packSrc = VkShaderSource.load("voxy:post/ssao.comp", defs.def("PACK_AO").build());
+        if (this.isBetterSSAO) {
+            packSrc = packSrc.replace("%%CONST_ARRAY%%", generateSamplePoints(this.spp));
+        }
+        this.packSource = packSrc;
+        var packBindings = new java.util.ArrayList<>(bindings);
+        packBindings.add(VkShaderPipeline.sampler(5));
+        this.packBindings = packBindings;
 
         this.params = new VkBuffer(ctx, 256).zero();
         ctx.flushImmediate();
@@ -146,8 +158,21 @@ public class VkSSAO {
                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         }
 
-        this.pipeline.bind(cmd);
-        try (var b = this.pipeline.binder()) {
+        VkShaderPipeline pipeline = this.pipeline;
+        if (viewport.isPackMode()) {
+            if (this.packPipeline == null) {
+                this.packPipeline = new VkShaderPipeline(this.ctx, "ssao-pack.comp", this.packSource, 0, this.packBindings);
+            }
+            pipeline = this.packPipeline;
+            viewport.packMeta.transition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+        }
+        pipeline.bind(cmd);
+        try (var b = pipeline.binder()) {
+            if (viewport.isPackMode()) {
+                b.sampler(5, viewport.packMeta.view, this.colourSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            }
             b.image(0, viewport.colourSSAO.view)
                     .sampler(1, viewport.colour.view, this.colourSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
                     .sampler(2, viewport.depthSampleView, this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -180,6 +205,7 @@ public class VkSSAO {
 
     public void free() {
         this.pipeline.free();
+        if (this.packPipeline != null) this.packPipeline.free();
         this.params.free();
         //colourSampler/depthSampler come from VkImage2D.createSampler's device-lifetime
         // cache (shared handles); never destroy them per-object (multi-free -> SIGSEGV).

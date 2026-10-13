@@ -42,7 +42,10 @@
     "vk.AccessorVulkanCommandEncoder",
     "vk.MixinSodiumOpaqueVkFrame",
     "vk.MixinVulkanDevice",
-    "vitrail.MixinVitrailEngineStages"
+    "vitrail.MixinVitrailEngineStages",
+    "vitrail.MixinVitrailShadowTerrain",
+    "vitrail.MixinVitrailShaderPackSource",
+    "vitrail.MixinVitrailEngineDefines"
   ],
   "injectors": {
     "defaultRequire": 1

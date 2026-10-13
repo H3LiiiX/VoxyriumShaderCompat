@@ -1,6 +1,8 @@
 package me.cortex.voxy.client.core.vk.render;
 
 import com.mojang.blaze3d.pipeline.RenderTarget;
+import me.cortex.voxy.client.compat.vitrail.VitrailVoxyPack;
+import me.cortex.voxy.client.compat.vitrail.VoxyPackPatch;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.RenderProperties;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
@@ -31,6 +33,8 @@ import net.minecraft.client.Minecraft;
 import java.util.Arrays;
 import java.util.List;
 
+import static org.lwjgl.vulkan.VK10.VK_FORMAT_D32_SFLOAT_S8_UINT;
+
 //The pure-Vulkan render core: constructed instead of the GL pipeline when MC
 // itself runs on Vulkan. Owns every GPU-facing subsystem (streams, geometry,
 // models, traversal, terrain renderer, compositor) on MC's adopted device, and
@@ -60,6 +64,11 @@ public class VkRenderCore {
     private final VkBoundRenderer boundRenderer;
     private final StreamedBoundStore visibleSectionStream;
     private boolean shutDown = false;
+    private Object packBlockIds;//the block id table baked into the models, see the constructor
+    private boolean rebuildRequested = false;
+    private boolean rebuildScheduled = false;
+    //Shaderpack LOD mode: the LOD translucents wait for the pack's deferred stage (renderDeferredTranslucents)
+    private VkCompositor.VkViewportRT deferredTranslucents;
     private final RenderDistanceTracker renderDistanceTracker;
     private final ViewportSelector<VkViewport> viewportSelector;
 
@@ -88,6 +97,12 @@ public class VkRenderCore {
 
             this.modelStore = new VkModelStore(this.frameCtx, this.uploadStream);
             this.modelService = new ModelBakerySubsystem(world.getMapper(), this.modelStore);
+            //A Vitrail shaderpack's LOD programs tell blocks apart by the pack's block ids, which are
+            // baked into each model (as the Iris pipeline does with Iris's mapping), so they have to be
+            // in place before the first model is
+            var packBlockIds = VitrailVoxyPack.blockStateIds();
+            this.packBlockIds = packBlockIds;
+            this.modelService.factory.setCustomBlockStateMapping(packBlockIds);
             this.renderGen = new RenderGenerationService(world, this.modelService, sm, false);
 
             this.geometryData = new VkSectionGeometryData(this.frameCtx, 1 << 20, geometryCapacity());
@@ -159,6 +174,33 @@ public class VkRenderCore {
         var crs = Minecraft.getInstance().gameRenderer.gameRenderState().levelRenderState.cameraRenderState;
         if (crs == null || !crs.initialized) return;
 
+        //Another pack, or the same one with other settings, can number blocks differently, and the
+        // models already baked carry the old numbers: rebuild the renderer (outside the frame) so
+        // every model is baked again against the new table
+        var packBlockIds = VitrailVoxyPack.blockStateIds();
+        if (!this.rebuildRequested && packBlockIds != this.packBlockIds) {
+            //Vitrail reads a new table on every reload, settings changes included; most of them number
+            // nothing differently
+            if (packBlockIds != null && packBlockIds.equals(this.packBlockIds)) {
+                this.packBlockIds = packBlockIds;
+            } else {
+                this.rebuildRequested = true;
+            }
+        }
+        if (this.rebuildRequested && !this.rebuildScheduled) {
+            this.rebuildScheduled = true;
+            Logger.info("The shaderpack's block ids changed, rebuilding the Voxy renderer");
+            Minecraft.getInstance().execute(() -> {
+                var holder = me.cortex.voxy.client.core.IVoxyRenderSystemHolder.getNullableHolder();
+                if (holder != null) {
+                    holder.voxy$shutdownRenderer();
+                    if (VoxyConfig.CONFIG.enableRendering) {
+                        holder.voxy$createRenderer();
+                    }
+                }
+            });
+        }
+
         this.frameCtx.flushImmediate();
         this.frameCtx.beginFrame(frameCmd);
         try {
@@ -183,7 +225,16 @@ public class VkRenderCore {
                     .update();
             viewport.frameId++;
             if (viewport.width <= 0 || viewport.height <= 0) return;
-            viewport.ensureTargets();
+
+            //A Vitrail shaderpack that ships Voxy LOD programs lights the LODs itself: its
+            // voxy_opaque/voxy_translucent are compiled into the terrain shaders (first frame after a
+            // pack or setting change) and the frame takes the pack-mode targets. Null leaves Voxy's
+            // own vanilla-lit path, which is also where a pack that fails to build ends up.
+            VoxyPackPatch pack = VitrailVoxyPack.current();
+            if (!this.terrainRenderer.preparePack(pack, VK_FORMAT_D32_SFLOAT_S8_UINT)) {
+                pack = null;
+            }
+            viewport.ensureTargets(pack == null ? -1 : pack.opaqueDataTargets().length);
 
             var rt = new VkCompositor.VkViewportRT(viewport,
                     target.getColorTextureView(), target.getDepthTextureView(), target.width, target.height);
@@ -215,12 +266,30 @@ public class VkRenderCore {
             // sanitized alpha), then translucents onto the SSAO output — the same
             // opaque->temporal->SSAO->translucent order as the GL pipeline
             this.terrainRenderer.renderTemporal(viewport);
+            //In shaderpack LOD mode too: the pack lights the LODs but has no ambient occlusion for them,
+            // their quads carrying none of the per-vertex AO real chunks do
             this.ssao.compute(viewport, rt);
-            this.terrainRenderer.renderTranslucent(viewport);
+            if (pack != null) {
+                //The pack's translucent LODs read the opaque depth (water depth fog, reflections)
+                this.compositor.offscreenToSampled(viewport);
+                this.terrainRenderer.buildPackDepth(viewport, rt);
+                this.compositor.offscreenToAttachment(viewport);
+            }
+            //A pack's LOD water is drawn where its real water is, after its deferred stage, so that stage
+            // processes the floor under it exactly as it does under real water and the water reaches the
+            // pack's depth the way real water does (see renderDeferredTranslucents)
+            boolean deferTranslucents = pack != null && this.terrainRenderer.hasPackTranslucent();
+            this.deferredTranslucents = null;
+            if (!deferTranslucents) {
+                this.terrainRenderer.renderTranslucent(viewport);
+            }
 
             //6. composite into MC's frame
             this.compositor.offscreenToSampled(viewport);
-            this.compositor.composite(rt);
+            this.compositor.composite(rt, pack == null ? null : pack.opaqueDataTargets());
+            if (deferTranslucents) {
+                this.deferredTranslucents = rt;
+            }
 
             //7. dynamic CPU work (uploads recycled, model baking, render distance tracking)
             this.uploadStream.tick();
@@ -232,7 +301,33 @@ public class VkRenderCore {
         }
     }
 
-    public void setRenderDistance(float renderDistance) {
+    /**
+     * The second half of a shaderpack frame: the LOD translucents, recorded right after the pack's
+     * deferred stage (MixinVitrailEngineStages), where the real water is drawn.
+     */
+    public void renderDeferredTranslucents(MinecraftVkHostAdapter adapter) {
+        var rt = this.deferredTranslucents;
+        if (rt == null) return;
+        this.deferredTranslucents = null;
+        var frameCmd = adapter.frameCommandBuffer();
+        if (frameCmd == null) return;
+        this.frameCtx.beginFrame(frameCmd);
+        try {
+            VitrailVoxyPack.setAfterDeferred(true);
+            var viewport = rt.viewport();
+            this.compositor.offscreenToAttachment(viewport);
+            this.terrainRenderer.renderDeferredTranslucent(viewport);
+            this.compositor.offscreenToSampled(viewport);
+            this.compositor.compositeTranslucents(rt);
+            this.uploadStream.tick();
+        } finally {
+            VitrailVoxyPack.setAfterDeferred(false);
+            this.frameCtx.endFrame();
+            this.frameCtx.pollRetired();
+        }
+    }
+
+        public void setRenderDistance(float renderDistance) {
         this.renderDistanceTracker.setRenderDistance((int) Math.ceil(renderDistance + 1));
     }
 

@@ -164,6 +164,7 @@ public class MDICSectionRenderer extends AbstractSectionRenderer<MDICViewport, B
         }
         MemoryUtil.memPutInt(ptr, viewport.frameId&0x7fffffff); ptr += 4;
         viewport.innerTranslation.getToAddress(ptr); ptr += 4*3;
+        MemoryUtil.memPutFloat(ptr, me.cortex.voxy.client.core.rendering.FluidSurface.relativeSurfaceY(viewport.section.y)); ptr += 4;
 
         AbstractUploadStream.INSTANCE().commit();
     }

@@ -7,6 +7,7 @@ layout(binding = 1, std140) uniform CompositeParams {
     mat4 projMat;
     vec4 endParams;
     vec4 fogColour;
+    vec4 fadeParams;
 };
 #ifdef EMIT_COLOUR
 layout(binding = 3) uniform sampler2D colourTex;
@@ -29,8 +30,30 @@ layout(location = 6) uniform vec4 fadeParams;
 
 #import <voxy:util/depthutils.glsl>
 
+#ifdef VOXY_VULKAN
+layout(location = 0) out vec4 colour;
+#else
 out vec4 colour;
+#endif
 in vec2 UV;
+
+//Shaderpack LOD programs: the pack's other opaque draw buffers (e.g. colortex6), written where the
+// LOD colour is
+#ifndef PACK_DATA_COUNT
+#define PACK_DATA_COUNT 0
+#endif
+#if PACK_DATA_COUNT > 0
+layout(binding = 4) uniform sampler2D packData0;
+layout(location = 1) out vec4 packOut0;
+#endif
+#if PACK_DATA_COUNT > 1
+layout(binding = 5) uniform sampler2D packData1;
+layout(location = 2) out vec4 packOut1;
+#endif
+#if PACK_DATA_COUNT > 2
+layout(binding = 6) uniform sampler2D packData2;
+layout(location = 3) out vec4 packOut2;
+#endif
 
 vec3 rev3d(vec3 clip) {
     vec4 view = invProjMat * vec4(SCREEN2NDC(clip),1.0f);
@@ -65,10 +88,35 @@ void main() {
     if (colour.a == 0.0) {
         discard;
     }
+    #ifdef PACK_LOD
+    //A translucent LOD with no opaque LOD behind it was blended over the cleared target, so its
+    // colour is premultiplied; the blend below multiplies by alpha again
+    if (colour.a < 1.0) {
+        colour.rgb /= colour.a;
+    }
+    #endif
+    #if PACK_DATA_COUNT > 0
+    packOut0 = texture(packData0, UV.xy);
+    #endif
+    #if PACK_DATA_COUNT > 1
+    packOut1 = texture(packData1, UV.xy);
+    #endif
+    #if PACK_DATA_COUNT > 2
+    packOut2 = texture(packData2, UV.xy);
+    #endif
+
     #ifdef HAS_FOG
     if (fogColour.a>0.0){
+        #ifdef VOXY_SHADER_FOG
+        float lPos = length(point.xyz);
+        float fogRel = lPos * endParams.x;
+        float fog4 = (fogRel * fogRel) * (fogRel * fogRel);
+        float fogLerp = clamp(1.0 - exp(-endParams.y * fog4), 0.0, 1.0);
+        colour.rgb = mix(colour.rgb, fogColour.rgb, fogLerp * fogColour.a);
+        #else
         float fogLerp = clamp(fma(length(point.xyz),endParams.x,endParams.y),0,endParams.z);//512 is 32*16 which is the render distance in blocks
         colour.rgb = mix(colour.rgb, fogColour.rgb, fogLerp*fogColour.a);
+        #endif
     }
     #endif
     #ifdef HAS_FADE
@@ -76,8 +124,10 @@ void main() {
     if (fadeParams.x>0) {
         float len = fadeParams.x>1.5?length(point.xyz):length(point.xz);
         colour.a *= 1-clamp(fma(len, fadeParams.z, fadeParams.y), 0,1);
+        if (colour.a <= 0.0) {
+            discard;
+        }
     }
-    //TODO: maybe discard if colour.a == 0?
     #endif
     #else
     colour = vec4(0);
