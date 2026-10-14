@@ -83,6 +83,7 @@ uvec3 makeRemainingAttributes(const in BlockModel model, const in Quad quad, uin
     #ifdef PATCHED_SHADER
     attributes.x = lighting;
     attributes.y = tintColour;
+    attributes.z = lodLevel;//(the unpatched path packs it in with the face, see below)
     #else
     bool isTranslucent = modelIsTranslucent(model);
 

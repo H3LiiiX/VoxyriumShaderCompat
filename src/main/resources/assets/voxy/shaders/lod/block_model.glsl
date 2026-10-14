@@ -46,3 +46,7 @@ bool modelIsShaded(BlockModel model) {
 bool modelIsFluid(BlockModel model) {
     return ((model.flagsA)&16u) != 0;
 }
+
+bool modelIsLava(BlockModel model) {
+    return ((model.flagsA)&64u) != 0;
+}

@@ -514,14 +514,13 @@ public final class VitrailVoxyPack {
                 //Repeating and filtered, Iris's choice: a pack indexes it well past one texel
                 return new Sampled((GpuTextureView) targetsNoise.invoke(l.targets), true, true);
             }
-            GpuTextureView view = samplerView(l, name);
-            return view == null ? null : new Sampled(view, false, false);
+            return samplerTarget(l, name);
         } catch (Throwable t) {
             return null;
         }
     }
 
-    private static GpuTextureView samplerView(Loaded l, String name) {
+    private static Sampled samplerTarget(Loaded l, String name) {
         try {
             OptionalInt index = (OptionalInt) targetNameIndex.invoke(null, name);
             if (index.isPresent()) {
@@ -533,16 +532,43 @@ public final class VitrailVoxyPack {
                 // except colortex19: colortex5 holds the same picture for the pack's own water (last
                 // frame's, as colortex19 would)
                 if (l.written != null && !l.written.contains(i)) {
-                    return i == 19 && l.written.contains(5) ? target(l, 5, false) : null;
+                    if (i != 19 || !l.written.contains(5)) return null;
+                    i = 5;
                 }
                 GpuTextureView view = target(l, i, false);
                 if (view == null && i == 19) {
-                    view = target(l, 5, false);
+                    i = 5;
+                    view = target(l, i, false);
                 }
-                return view;
+                return view == null ? null : new Sampled(view, linear(l, i), false);
             }
         } catch (Throwable ignored) {}
         return null;
+    }
+
+    private static Method targetsFilter;
+    private static boolean targetsFilterReflected;
+
+    //Whether the pack's own programs read colortex<index> filtered, which Vitrail (like Iris) does for
+    // every buffer that is not of an integer format. Read unfiltered, the LOD ice's reflections took the
+    // nearest texel of the scene where the real ice's blend the four around it: out at the LODs, where
+    // a reflection squeezes many pixels into each texel, that showed as hard steps, which shifted with
+    // every pixel's random step offset into a pattern that crawled about as the camera moved
+    private static boolean linear(Loaded l, int index) {
+        if (!targetsFilterReflected) {
+            targetsFilterReflected = true;
+            try {
+                targetsFilter = method(Class.forName("dev.vitrail.render.ColorTargets"), "filter", int.class);
+            } catch (Throwable t) {
+                targetsFilter = null;
+            }
+        }
+        if (targetsFilter == null) return false;
+        try {
+            return "LINEAR".equals(String.valueOf(targetsFilter.invoke(l.targets, index)));
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     /** The colour target the gbuffer stage writes {@code colortex<index>} into, or null. */
@@ -574,6 +600,28 @@ public final class VitrailVoxyPack {
                 targetsCoverage = method(Class.forName("dev.vitrail.render.ColorTargets"), "coverage");
             }
             return targetsCoverage == null ? null : (GpuTextureView) targetsCoverage.invoke(l.targets);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static Method terrainSamplerGet;
+    private static boolean terrainSamplerReflected;
+
+    //The sampler the pack's own terrain reads the block atlas through (nearest, blended mips, the
+    // player's anisotropy), or null outside Vitrail
+    public static com.mojang.renderpearl.api.textures.GpuSampler terrainSampler() {
+        if (!terrainSamplerReflected) {
+            terrainSamplerReflected = true;
+            try {
+                terrainSamplerGet = Class.forName("dev.vitrail.render.TerrainSampler").getMethod("get");
+            } catch (Throwable t) {
+                terrainSamplerGet = null;
+            }
+        }
+        if (terrainSamplerGet == null) return null;
+        try {
+            return (com.mojang.renderpearl.api.textures.GpuSampler) terrainSamplerGet.invoke(null);
         } catch (Throwable t) {
             return null;
         }

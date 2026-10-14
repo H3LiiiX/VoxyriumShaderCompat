@@ -333,6 +333,19 @@ public class RenderDataFactory {
         return state.isSolid() ? -1.0f : 0.0f;
     }
 
+    //The top of a fluid under another state of the same fluid (a falling or flowing column standing in a lake).
+    // The game raises such a block to full height to meet the column, but the sea's top faces are pinned flat
+    // at 8/9 of a block (quad_util.glsl), so with this one left out a ninth of a block stood open between the
+    // surface and the column, a black slot down to the lake floor around its foot. Drawn, it is pinned with
+    // the rest of the surface (and away from the surface its corners rise to meet the column). Opaque fluids
+    // only: a surface inside translucent water would show through it
+    private boolean isOpaqueFluidTopUnderOtherState(long state, long aboveState, long metadata) {
+        if (!ModelQueries.isFluid(metadata) || ModelQueries.isTranslucent(metadata)) {
+            return false;
+        }
+        return Mapper.getBlockId(state) != Mapper.getBlockId(aboveState) && this.statesShareFluid(state, aboveState);
+    }
+
     private boolean statesShareFluid(long firstState, long secondState) {
         Mapper mapper = this.world.getMapper();
         FluidState firstFluid = mapper.getBlockStateFromBlockId(Mapper.getBlockId(firstState)).getFluidState();
@@ -739,6 +752,16 @@ public class RenderDataFactory {
                     //hidden by a solid below, and vertically continuous fluid
                     //has no internal interface at all.
                     msk = (current&~next)|(next&~current&~this.opaqueMasks[pidx]);
+                    int stacked = current&next;
+                    while (stacked != 0) {
+                        int index = Integer.numberOfTrailingZeros(stacked);
+                        stacked &= stacked-1;
+                        int idx = index + (pidx*32);
+                        long[] raw = this.fluidSourceSection._unsafeGetRawDataArray();
+                        if (this.isOpaqueFluidTopUnderOtherState(raw[idx], raw[idx + 32*32], this.sectionData[idx*2 + 1])) {
+                            msk |= 1<<index;
+                        }
+                    }
                 } else {
                     msk = (current | this.opaqueMasks[pidx]) ^ (next | this.opaqueMasks[pidx + skipAmount]);
                     msk &= current|next;
@@ -852,7 +875,8 @@ public class RenderDataFactory {
                         //Fluid level/state may differ across a section border,
                         //but water remains continuous with water (and likewise
                         //for lava), so never emit an internal face between them.
-                        if (this.statesShareFluid(rawState, neighborId)) {
+                        if (this.statesShareFluid(rawState, neighborId) && !(axis == 0 && side == 1
+                                && this.isOpaqueFluidTopUnderOtherState(rawState, neighborId, this.sectionData[idx * 2 + 1]))) {
                             this.blockMesher.skip(1);
                             continue;
                         }

@@ -21,6 +21,7 @@ import net.minecraft.core.Direction;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.tags.BlockTags;
+import net.minecraft.tags.FluidTags;
 import net.minecraft.world.level.CardinalLighting;
 import net.minecraft.world.level.ColorResolver;
 import net.minecraft.world.level.LightLayer;
@@ -617,6 +618,7 @@ public class ModelFactory {
         modelFlags |= isShaded?8:0;//model has AO and shade
         modelFlags |= isFluid?16:0;//fluid side faces need their geometry snapped to block boundaries
         modelFlags |= needsDoubleSidedQuads?32:0;//keep crossed/partial models when rejecting rear-facing quads
+        modelFlags |= isFluid && blockState.getFluidState().is(FluidTags.LAVA)?64:0;//drawn with the game's animated lava sprite
 
         //modelFlags |= blockRenderLayer == RenderLayer.getSolid()?0:1;// should discard alpha
         MemoryUtil.memPutInt(uploadPtr, modelFlags); uploadPtr += 4;

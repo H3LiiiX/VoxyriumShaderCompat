@@ -69,6 +69,8 @@ public final class VulkanContext {
      * non-macOS Vulkan implementation keep the regular discard shader.
      */
     public final boolean needsSampleMaskDiscard;
+    /** Running on macOS, where MoltenVK turns the SPIR-V into Metal Shading Language. */
+    public final boolean macOS;
     public final long commandPool;
     private VkPhysicalDeviceSubgroupProperties subgroupProps;
 
@@ -106,6 +108,7 @@ public final class VulkanContext {
             this.commandPool = pPool.get(0);
         }
         boolean macOS = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("mac");
+        this.macOS = macOS;
         this.needsSampleMaskDiscard = macOS && vendorId != 0x106B;//Apple's PCI vendor id
         this.deviceName = name + " (MC host)";
         Logger.info("Voxy Vulkan context adopted Minecraft device: " + this.deviceName

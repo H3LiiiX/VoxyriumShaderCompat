@@ -166,16 +166,23 @@ void main() {
 
     #ifdef HAS_FOG
     if (fogColour.a>0.0){
+        //endParams.w above 1.5: the shaderpack's border fog (endParams as below) also where the LODs go
+        // into the game's own image, which Vitrail paints back into the pack. Read as the linear fog
+        // there, those parameters fogged every LOD whole (into solid fog colour)
         #ifdef VOXY_SHADER_FOG
+        if (true) {
+        #else
+        if (endParams.w > 1.5) {
+        #endif
         float lPos = length(point.xyz);
         float fogRel = lPos * endParams.x;
         float fog4 = (fogRel * fogRel) * (fogRel * fogRel);
         float fogLerp = clamp(1.0 - exp(-endParams.y * fog4), 0.0, 1.0);
         colour.rgb = mix(colour.rgb, fogColour.rgb, fogLerp * fogColour.a);
-        #else
+        } else {
         float fogLerp = clamp(fma(length(point.xyz),endParams.x,endParams.y),0,endParams.z);//512 is 32*16 which is the render distance in blocks
         colour.rgb = mix(colour.rgb, fogColour.rgb, fogLerp*fogColour.a);
-        #endif
+        }
     }
     #endif
     #ifdef HAS_FADE

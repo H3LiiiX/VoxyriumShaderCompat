@@ -46,12 +46,12 @@ layout(location = 7) in flat uint quadDebug;
 
 #ifndef PATCHED_SHADER
 layout(location = 0) out vec4 outColour;
-#else
+#endif
 
+#if defined PATCHED_SHADER || defined ANIMATED_LAVA
 //Bind the model buffer and import the model system as we need it
 #define MODEL_BUFFER_BINDING 3
 #import <voxy:lod/block_model.glsl>
-
 #endif
 
 #import <voxy:lod/gl46/bindings.glsl>
@@ -110,6 +110,28 @@ layout(binding = 6) uniform sampler2D voxyLightTex;//what the prepass wrote
 // the frame Voxy baked into its atlas, so it moves like the water in real chunks
 layout(binding = 7) uniform sampler2D voxyWaterAtlas;
 layout(push_constant) uniform VoxyWaterPush { vec4 voxyWaterSprite; };//u0, v0, u1, v1 of water_still
+#endif
+
+#ifdef ANIMATED_LAVA
+//Lava is drawn with Minecraft's own (animated) lava sprite rather than the frame Voxy baked into its
+// atlas, so it pulses in step with the lava in real chunks instead of holding one frame
+layout(binding = 7) uniform sampler2D voxyLavaAtlas;
+layout(push_constant) uniform VoxyLavaPush { vec4 voxyLavaSprite; };//u0, v0, u1, v1 of lava_still
+
+//The sprite repeats once per real block, as on real lava, rather than once per LOD block: stretched
+// over a coarse LOD block its pulsing blotches showed several times their size, where real lava that
+// far off is sampled from a mip that has averaged them out
+vec4 voxyLavaColour(vec2 uv, vec2 dx, vec2 dy) {
+    #ifdef PATCHED_SHADER
+    uint lodLevel = interData.w & 7u;
+    #else
+    uint lodLevel = (interData.w >> 3) & 7u;
+    #endif
+    float blocks = float(1u << lodLevel);
+    vec2 spriteSize = voxyLavaSprite.zw - voxyLavaSprite.xy;
+    return vec4(textureGrad(voxyLavaAtlas, voxyLavaSprite.xy + fract(uv * blocks) * spriteSize,
+                            dx * blocks * spriteSize, dy * blocks * spriteSize).rgb, 1.0);
+}
 #endif
 
 #ifdef PATCHED_SHADER
@@ -225,7 +247,7 @@ void main() {
         vec2 dy = dFdy(uvSmol);//vec2(lDy, dDy);
         colour = textureGrad(blockModelAtlas, texPos, dx, dy);
     }// else {
-    #ifdef PACK_ANIMATED_WATER
+    #if defined PACK_ANIMATED_WATER || defined ANIMATED_LAVA
     //Taken here, before helper invocations leave, like the gradients above
     vec2 waterDx = dFdx(uv);
     vec2 waterDy = dFdy(uv);
@@ -276,6 +298,11 @@ void main() {
     #endif
 
     #ifndef PATCHED_SHADER
+    #ifdef ANIMATED_LAVA
+    if (modelIsLava(modelData[getModelId()])) {
+        colour = voxyLavaColour(uv, waterDx, waterDy);
+    }
+    #endif
     colour = computeColour(texPos, colour);
     outColour = colour;
 
@@ -303,6 +330,12 @@ void main() {
     if (doTint) {
         tint = uint2vec4RGBA(interData.z).yzwx;
     }
+
+    #ifdef ANIMATED_LAVA
+    if (modelIsLava(model)) {
+        colour = voxyLavaColour(uv, waterDx, waterDy);
+    }
+    #endif
 
     #ifdef PACK_ANIMATED_WATER
     if (modelIsFluid(model) && modelIsTranslucent(model)) {

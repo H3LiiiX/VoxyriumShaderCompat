@@ -467,12 +467,15 @@ public class VkCompositor {
         int mcColorFormat = VkFrameHost.vkFormat(rt.mcColour);
         int mcDepthFormat = VkFrameHost.vkFormat(rt.mcDepth);
         //Vitrail paints the game's own picture into the terrain's first draw buffer wherever its coverage
-        // mask does not claim the pixel for the pack. With a colour LOD that buffer is colortex0 and the
-        // picture painted back is the LODs' own (they are composited into it below); without one it is
-        // pack data (Photon's colortex1), and the picture painted over the LODs was the sky. So there the
-        // LODs claim their pixels in the mask, with the very depth they leave in the game's depth, which
-        // is what the mask holds for the pack's own terrain
-        GpuTextureView coverage = emitsColour ? null : VitrailVoxyPack.coverage();
+        // mask does not claim the pixel for the pack. Without a colour LOD that buffer is pack data
+        // (Photon's colortex1), and the picture painted over the LODs was the sky. With one it is colortex0,
+        // and the picture painted back was the LODs' own (composited into the game's image below), but
+        // through the game's 8 bit image: everything over 1 was cut off, which is most of an emissive
+        // block's light in the packs' float colortex0 (LOD lava a duller, darker orange than the real lava
+        // beside it). So the LODs of every pack with LOD programs claim their pixels in the mask, with the
+        // very depth they leave in the game's depth, which is what the mask holds for the pack's own
+        // terrain, and keep the colour composited into the pack's own targets
+        GpuTextureView coverage = layout != null ? VitrailVoxyPack.coverage() : null;
         if (coverage != null && (coverage.getWidth(0) != rt.mcWidth || coverage.getHeight(0) != rt.mcHeight
                 || VkFrameHost.vkFormat(coverage) != VK_FORMAT_R32_SFLOAT
                 //the mask is compared for equality with the depth as stored, which a float depth keeps exactly
@@ -625,7 +628,7 @@ public class VkCompositor {
                 e0 = 1.0f / rd;
                 e1 = 3.0f; // Exponent factor matching Complementary's 1.0 - exp(-3.0 * (lPos / rd)^4)
                 e2 = 1.0f;
-                e3 = 1.0f;
+                e3 = 2.0f; // that formula in every composite, see blit_texture_depth_cutout.frag
 
                 if (viewport.fogParameters != null) {
                     f0 = viewport.fogParameters.red();

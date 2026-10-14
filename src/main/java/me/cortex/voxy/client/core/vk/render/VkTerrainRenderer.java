@@ -212,6 +212,7 @@ public class VkTerrainRenderer {
         opaque.vertGlsl = vert;
         opaque.fragGlsl = VkShaderSource.load("voxy:lod/gl46/quads.frag", VkShaderSource.defs().props(this.properties)
                 .defIf("VOXY_VULKAN_SAMPLE_MASK_DISCARD", this.ctx.vk().needsSampleMaskDiscard)
+                .def("ANIMATED_LAVA")
                 .build());
         opaque.colorFormat = cf;
         opaque.depthFormat = df;
@@ -221,7 +222,10 @@ public class VkTerrainRenderer {
         opaque.depthCompare = VkCmd.closerEqual(this.properties);
         opaque.blend = false;
         opaque.stencilTestEqual1 = true;//only render where vanilla terrain is absent
-        opaque.bindings = bindings;
+        var opaqueBindings = new ArrayList<>(bindings);
+        opaqueBindings.add(VkShaderPipeline.sampler(7));//Minecraft's block atlas, for the lava sprite
+        opaque.bindings = opaqueBindings;
+        opaque.pushConstantBytes = 16;
         this.terrainOpaque = new VkShaderPipeline(this.ctx, opaque);
 
         var translucent = new VkShaderPipeline.GfxDesc();
@@ -326,7 +330,7 @@ public class VkTerrainRenderer {
             d.name = "terrain-pack-light";
             d.vertGlsl = vert;
             d.fragGlsl = VkShaderSource.load("voxy:lod/gl46/quads.frag", VkShaderSource.defs().props(this.properties)
-                    .defIf("VOXY_VULKAN_SAMPLE_MASK_DISCARD", this.ctx.vk().needsSampleMaskDiscard)
+                    .defIf("VOXY_VULKAN_SAMPLE_MASK_DISCARD", this.packSampleMaskDiscard())
                     .def("PATCHED_SHADER")
                     .def("VOXY_SMOOTH_LIGHT")
                     .def("VOXY_LIGHT_PREPASS")
@@ -353,11 +357,12 @@ public class VkTerrainRenderer {
 
         {
             String frag = VkShaderSource.load("voxy:lod/gl46/quads.frag", VkShaderSource.defs().props(this.properties)
-                    .defIf("VOXY_VULKAN_SAMPLE_MASK_DISCARD", this.ctx.vk().needsSampleMaskDiscard)
+                    .defIf("VOXY_VULKAN_SAMPLE_MASK_DISCARD", this.packSampleMaskDiscard())
                     .def("PATCHED_SHADER")
                     .def("VOXY_SMOOTH_LIGHT")
+                    .def("ANIMATED_LAVA")
                     .def("VOXY_PACK_AO_LOCATION", opaqueCount)
-                    .build()) + patch.opaqueFragmentTail();
+                    .build()) + this.packTail(patch.opaqueFragmentTail());
             var spirv = ShadercCompiler.compile(frag, ShaderType.FRAGMENT, "terrain-pack-opaque.frag");
             this.packOpaqueSamplers = usedSamplers(patch, spirv);
 
@@ -375,21 +380,23 @@ public class VkTerrainRenderer {
             d.stencilTestEqual1 = true;
             var bindings = packBindings(this.packOpaqueSamplers);
             bindings.add(VkShaderPipeline.sampler(6));//the light prepass
+            bindings.add(VkShaderPipeline.sampler(7));//Minecraft's block atlas, for the lava sprite
             d.bindings = bindings;
+            d.pushConstantBytes = 16;
             this.packOpaque = new VkShaderPipeline(this.ctx, d);
         }
 
         if (patch.hasTranslucent()) {
             int translucentCount = layout.translucentCount();
             String frag = VkShaderSource.load("voxy:lod/gl46/quads.frag", VkShaderSource.defs().props(this.properties)
-                    .defIf("VOXY_VULKAN_SAMPLE_MASK_DISCARD", this.ctx.vk().needsSampleMaskDiscard)
+                    .defIf("VOXY_VULKAN_SAMPLE_MASK_DISCARD", this.packSampleMaskDiscard())
                     .def("PATCHED_SHADER")
                     .def("TRANSLUCENT")
                     .def("PACK_ANIMATED_WATER")
                     .def("VOXY_TRANSLUCENT_AFTER_DEFERRED")//drawn by renderDeferredTranslucent
                     //After the pack's draw buffers: where the translucent program drew, for the composite
                     .def("VOXY_PACK_AO_LOCATION", translucentCount)
-                    .build()) + patch.translucentFragmentTail();
+                    .build()) + this.packTail(patch.translucentFragmentTail());
             var spirv = ShadercCompiler.compile(frag, ShaderType.FRAGMENT, "terrain-pack-translucent.frag");
             this.packTranslucentSamplers = usedSamplers(patch, spirv);
 
@@ -414,8 +421,39 @@ public class VkTerrainRenderer {
             bindings.add(VkShaderPipeline.sampler(7));//Minecraft's block atlas, for the water sprite
             d.bindings = bindings;
             d.pushConstantBytes = 16;
-            this.packTranslucent = new VkShaderPipeline(this.ctx, d);
+            try {
+                this.packTranslucent = new VkShaderPipeline(this.ctx, d);
+            } catch (Throwable t) {
+                //The opaque programs stand on their own: without the translucent one the LOD water is
+                // Voxy's own, as for a pack with no translucent program, rather than every LOD losing
+                // the pack's lighting (MoltenVK turns some of these pipelines down)
+                this.packTranslucent = null;
+                Logger.error("The shaderpack's translucent Voxy LOD program failed to build, LOD water keeps Voxy's own shading", t);
+            }
         }
+    }
+
+    //The shaderpack LOD programs on macOS drop their cut-out pixels through a zero sample mask, not a discard:
+    // with a pack's code behind it (Complementary, Solas) Apple GPUs too kept the depth of a discarded pixel
+    // without its colour, so the pack shaded leaves and bars from whatever its targets held there. That path
+    // also never reads gl_HelperInvocation, which SPIRV-Cross then sets before every discard, out of scope in
+    // a pack's own function that discards (its LOD water), so Metal refused the whole program
+    private boolean packSampleMaskDiscard() {
+        return this.ctx.vk().needsSampleMaskDiscard || this.ctx.vk().macOS;
+    }
+
+    //A shaderpack's own functions named like Metal's built-ins: MoltenVK keeps the name, and a definition with
+    // the very signature of the built-in made every call to it ambiguous (Photon's length_squared), which failed
+    // the whole program. Renamed throughout the pack's code on macOS
+    private static final String[] METAL_BUILTIN_NAMES = {"length_squared", "distance_squared"};
+
+    private String packTail(String tail) {
+        if (!this.ctx.vk().macOS) return tail;
+        StringBuilder renames = new StringBuilder("\n");
+        for (String name : METAL_BUILTIN_NAMES) {
+            renames.append("#define ").append(name).append(" voxy_").append(name).append('\n');
+        }
+        return renames + tail;
     }
 
     //Only what the compiled program actually reads gets a descriptor: a pack lists names that only
@@ -618,13 +656,17 @@ public class VkTerrainRenderer {
 
     private static final net.minecraft.resources.Identifier WATER_STILL =
             net.minecraft.resources.Identifier.fromNamespaceAndPath("minecraft", "block/water_still");
+    private static final net.minecraft.resources.Identifier LAVA_STILL =
+            net.minecraft.resources.Identifier.fromNamespaceAndPath("minecraft", "block/lava_still");
 
-    //Minecraft's block atlas and the water sprite's corners in it, for PACK_ANIMATED_WATER
-    private void bindWater(VkShaderPipeline pipeline, VkShaderPipeline.Binder b, VkCommandBuffer cmd) {
+    //Minecraft's block atlas and a fluid sprite's corners in it: water_still for PACK_ANIMATED_WATER,
+    // lava_still for ANIMATED_LAVA
+    private void bindFluidSprite(VkShaderPipeline pipeline, VkShaderPipeline.Binder b, VkCommandBuffer cmd,
+                                 net.minecraft.resources.Identifier spriteId, long sampler) {
         var atlas = (net.minecraft.client.renderer.texture.TextureAtlas) net.minecraft.client.Minecraft.getInstance()
                 .getTextureManager().getTexture(net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_BLOCKS);
-        var sprite = atlas.getSprite(WATER_STILL);
-        b.sampler(7, VkFrameHost.vkView(atlas.getTextureView()), this.packWaterSampler, VK_IMAGE_LAYOUT_GENERAL);
+        var sprite = atlas.getSprite(spriteId);
+        b.sampler(7, VkFrameHost.vkView(atlas.getTextureView()), sampler, VK_IMAGE_LAYOUT_GENERAL);
         try (MemoryStack stack = stackPush()) {
             var pc = stack.malloc(16);
             pc.putFloat(0, sprite.getU0()).putFloat(4, sprite.getV0()).putFloat(8, sprite.getU1()).putFloat(12, sprite.getV1());
@@ -705,6 +747,13 @@ public class VkTerrainRenderer {
         if (!this.hasPackTranslucent() || this.geometry.getSectionCount() == 0) return;
         int cap = Math.min(this.geometry.getSectionCount(), VkViewport.TRANSLUCENT_DRAW_COUNT);
         int maxDraw = this.fixedCountBudget(this.fbTranslucentDraws, 256, cap);
+        //The pack's deferred stage has just written its targets as attachments, among them the scene the
+        // LOD water and ice reflect (Complementary's colortex5): wait for those writes, as renderOpaque
+        // does, or the reflections read parts of last frame's scene and trail behind when moving
+        this.ctx.barrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+                        | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
         this.renderTerrain(viewport, views, this.packTranslucent, this.packTranslucentSamplers,
                 TRANSLUCENT_OFFSET * 5L * 4, 4 * 4, maxDraw, false);
     }
@@ -981,7 +1030,19 @@ public class VkTerrainRenderer {
                 this.bindPackSamplers(b, packSamplers);
             }
             if (pipeline == this.packTranslucent) {
-                this.bindWater(pipeline, b, cmd);
+                this.bindFluidSprite(pipeline, b, cmd, WATER_STILL, this.packWaterSampler);
+            }
+            if (pipeline == this.packOpaque) {
+                //Read as the pack's real lava is: with a mip picked whole (where that sampler blends two)
+                // the LOD lava came out more averaged than the real lava beside it, and through the pack's
+                // gamma and emission an averaged lava texture is darker and redder than the real one
+                var terrainSampler = VitrailVoxyPack.terrainSampler();
+                boolean useTerrainSampler = terrainSampler instanceof com.mojang.renderpearl.backend.vulkan.VulkanGpuSampler vk
+                        && !vk.isClosed();
+                this.bindFluidSprite(pipeline, b, cmd, LAVA_STILL, useTerrainSampler
+                        ? ((com.mojang.renderpearl.backend.vulkan.VulkanGpuSampler) terrainSampler).vkSampler() : this.packWaterSampler);
+            } else if (pipeline == this.terrainOpaque) {
+                this.bindFluidSprite(pipeline, b, cmd, LAVA_STILL, this.packWaterSampler);
             }
             if (pipeline == this.packOpaque) {
                 b.sampler(6, viewport.packLight.view, this.packNearestSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);

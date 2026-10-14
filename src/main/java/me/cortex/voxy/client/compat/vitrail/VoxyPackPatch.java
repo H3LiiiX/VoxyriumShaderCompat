@@ -311,6 +311,10 @@ public final class VoxyPackPatch {
                 Matcher m = OWN_UNIFORM_LINE.matcher(line);
                 if (m.matches() && hoisted.contains(m.group(2))) {
                     line = "";
+                } else if ((m = OWN_UNIFORM_LIST_LINE.matcher(line)).matches()) {
+                    boolean all = true;
+                    for (String name : m.group(2).split(",")) all &= hoisted.contains(name.trim());
+                    if (all) line = "";
                 }
                 out.append(line).append('\n');
             }
@@ -326,6 +330,8 @@ public final class VoxyPackPatch {
 
     //One plain declaration on its own line: no layout, no initialiser, no list
     private static final Pattern OWN_UNIFORM_LINE = Pattern.compile("\\s*uniform\\s+(\\w+)\\s+(\\w+)\\s*;\\s*(?://.*)?");
+    //The same with several names of one type (BSL's Nether colours: uniform float isValley, isCrimson, ...)
+    private static final Pattern OWN_UNIFORM_LIST_LINE = Pattern.compile("\\s*uniform\\s+(\\w+)\\s+(\\w+(?:\\s*,\\s*\\w+)+)\\s*;\\s*(?://.*)?");
 
     /**
      * Collects the declaration a line of the LOD programs makes outside any block, if it is one that
@@ -336,6 +342,10 @@ public final class VoxyPackPatch {
         Matcher m = OWN_UNIFORM_LINE.matcher(line);
         if (m.matches()) {
             into.putIfAbsent(m.group(2), m.group(1));
+        } else if ((m = OWN_UNIFORM_LIST_LINE.matcher(line)).matches()) {
+            for (String name : m.group(2).split(",")) {
+                into.putIfAbsent(name.trim(), m.group(1));
+            }
         }
     }
 

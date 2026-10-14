@@ -212,11 +212,29 @@ public final class VitrailVkCompat {
                 || normPath.endsWith("lib/atmosphere/fog.glsl")) {
             //BSL's fog and cloud fog, Solas's fog
             return patchFarFogForLods(lines);
+        } else if (normPath.endsWith("lib/atmospherics/volumetricLight/volumetricLight.glsl")) {
+            return patchComplementaryLodVolumetricLight(lines);
+        } else if (normPath.endsWith("lib/vertex/waving.glsl")) {
+            return patchBslLavaWaves(lines);
+        } else if (normPath.endsWith("program/gbuffers_all_solid.vsh")) {
+            return patchPhotonLavaAo(lines);
         } else if (normPath.endsWith("include/fog/simple_fog.glsl")) {
             //Photon's border fog
             return patchPhotonBorderFog(lines);
         } else if (normPath.endsWith("gbuffers_water.glsl") || normPath.endsWith("include/vertex/displacement.glsl")) {
             return patchWaterWaveFade(lines);
+        } else if (normPath.endsWith("include/lighting/diffuse_lighting.glsl")) {
+            //Photon's diffuse lighting: the shadowed one for its LOD translucents too (see patchPhotonLodWater)
+            List<String> result = null;
+            for (int i = 0; i < lines.size(); i++) {
+                if (lines.get(i).trim().equals("#if defined SHADOW || defined SHADOW_SSRT")) {
+                    if (result == null) result = new ArrayList<>(lines);
+                    result.set(i, "#if defined SHADOW || defined SHADOW_SSRT || defined VOXY_PACK_SHADOW_LIGHTING");
+                }
+            }
+            return result == null ? lines : result;
+        } else if (normPath.endsWith("include/misc/raytracer.glsl")) {
+            return patchPhotonLodWaterRaytracer(lines);
         } else if (normPath.endsWith("lib/pbr/raytracer.glsl")) {
             //Solas's reflections march the ray through the game's projection and drop a hit whose depth
             // falls past its far plane. The LOD water lies past it, and so does everything its rays reach,
@@ -272,6 +290,14 @@ public final class VitrailVkCompat {
                 if (lines.get(i).trim().equals("\"translucentDrawBuffers\": [0, 1, 7],")) {
                     if (result == null) result = new ArrayList<>(lines);
                     result.set(i, lines.get(i).replace("[0, 1, 7]", "[0, 1, 3]"));
+                }
+                //Complementary's LOD terrain also writes colortex4, the normal its real terrain leaves there
+                // (see defineVoxy)
+                if (lines.get(i).trim().equals("\"opaqueDrawBuffers\": [") && i + 3 < lines.size()
+                        && lines.get(i + 1).trim().equals("0,") && lines.get(i + 2).trim().equals("6")
+                        && lines.get(i + 3).trim().startsWith("]")) {
+                    if (result == null) result = new ArrayList<>(lines);
+                    result.set(i + 2, lines.get(i + 2).replace("6", "6, 4"));
                 }
             }
             return result == null ? lines : result;
@@ -372,6 +398,31 @@ public final class VitrailVkCompat {
                 result.add("    #endif");
                 continue;
             }
+            //The real water reflects the sky only where it has full sky light, and under a sheet of ice it
+            // has it (the game lights its surface from the ice above), where the LOD water takes the ice's
+            // own sky light, a level or two short: it reflected nothing but its own dark colour, and LOD ice
+            // was darker and more see-through than the real ice. Water within two levels of full sky light
+            // reflects the sky as the real water there does
+            if (trimmed.equals("getReflection(albedo, viewPos, newNormal, fresnel, lightmap.y);")) {
+                result.add("\t\t#ifdef VOXY_TRANSLUCENT_AFTER_DEFERRED");
+                result.add(line.replace("lightmap.y)", "water > 0.5 && lightmap.y > 0.85 ? 1.0 : lightmap.y)"));
+                result.add("\t\t#else");
+                result.add(line);
+                result.add("\t\t#endif");
+                continue;
+            }
+            //The strength of the reflection (its fresnel, which also decides how opaque the water is) comes
+            // from the flat surface for the real water and from the wave normal for this one, so the sky it
+            // reflects came and went with the waves: faint ripples on LOD ice that the real ice has none of.
+            // The real water's, from the flat surface
+            if (trimmed.equals("float fresnel = clamp(1.0 + dot(normalize(newNormal), nViewPos), 0.0, 1.0) * snellWindow;")) {
+                result.add("\t\t#ifdef VOXY_TRANSLUCENT_AFTER_DEFERRED");
+                result.add(line.replace("normalize(newNormal)", "normalize(normal)"));
+                result.add("\t\t#else");
+                result.add(line);
+                result.add("\t\t#endif");
+                continue;
+            }
             if (outPatched && trimmed.equals("out2 = albedo;")) {
                 String indent = line.substring(0, line.indexOf('o'));
                 result.add("    #ifdef VOXY_TRANSLUCENT_AFTER_DEFERRED");
@@ -419,9 +470,36 @@ public final class VitrailVkCompat {
     }
 
     private static List<String> patchPhotonLodWater(List<String> lines) {
-        List<String> result = new ArrayList<>(lines.size() + 24);
+        List<String> result = new ArrayList<>(lines.size() + 40);
         for (String line : lines) {
             String trimmed = line.trim();
+            //The program turns the pack's shadows off for itself (it has no shadow map to read), and with
+            // them its diffuse lighting falls back to the one Photon uses when shadows are disabled, a
+            // flatter one with a strong glow for ice. The pack's real translucents (and its LOD terrain,
+            // lit in the deferred stage) take the shadowed one, so with shadows on LOD ice was whiter
+            // than the real ice beside it. The shadowed lighting, with what the pack hands a surface
+            // past its shadow map: the lightmap's shadow, no light through the surface from the map
+            if (trimmed.equals("#undef SHADOW")) {
+                result.add("#ifdef VOXY_TRANSLUCENT_AFTER_DEFERRED");
+                result.add("#define VOXY_PACK_SHADOW_LIGHTING");
+                result.add("#endif");
+            }
+            if (trimmed.equals("vec3 shadows = vec3(pow8(parameters.lightMap.y)); // Fake shadow")) {
+                result.add("#ifdef VOXY_PACK_SHADOW_LIGHTING");
+                result.add("    vec3 shadows = vec3(smoothstep(13.5 / 15.0, 14.5 / 15.0, parameters.lightMap.y));");
+                result.add("#else");
+                result.add(line);
+                result.add("#endif");
+                continue;
+            }
+            if (trimmed.equals("#define shadow_distance_fade 0.0")) {
+                result.add("#ifdef VOXY_PACK_SHADOW_LIGHTING");
+                result.add("#define shadow_distance_fade 1.0");
+                result.add("#else");
+                result.add(line);
+                result.add("#endif");
+                continue;
+            }
             if (trimmed.equals("layout(location = 0) out vec4 fragment_color;")) {
                 result.add("#include \"/include/misc/distant_water.glsl\"");
             }
@@ -437,9 +515,24 @@ public final class VitrailVkCompat {
             //Its blend takes the colour premultiplied (ONE, ONE_MINUS_SRC_ALPHA), as the real translucents
             // write it (their lighting times the alpha), but for everything but water this program left
             // the alpha out: LOD ice went in at its full lit colour, brighter than the real ice
+            //Its real translucents then add the sun's highlight and the reflections (ice, glass), which this
+            // program left out for all but water, so LOD ice reflected nothing beside the real ice
             if (trimmed.equals("fragment_color.a = alpha;")) {
                 result.add("    #ifdef VOXY_TRANSLUCENT_AFTER_DEFERRED");
-                result.add("    if (material_mask != MATERIAL_WATER) fragment_color.rgb *= alpha;");
+                result.add("    if (material_mask != MATERIAL_WATER) {");
+                result.add("        fragment_color.rgb *= alpha;");
+                result.add("        #if defined WORLD_OVERWORLD || defined WORLD_END");
+                result.add("        fragment_color.rgb += get_specular_highlight(material, NoL, NoV, NoH, LoV, LoH) * light_color * shadows;");
+                result.add("        #endif");
+                result.add("        #if defined ENVIRONMENT_REFLECTIONS || defined SKY_REFLECTIONS");
+                result.add("        if (material.ssr_multiplier > eps) {");
+                result.add("            mat3 voxyTbn = get_tbn_matrix(normal);");
+                result.add("            fragment_color.rgb += get_specular_reflections(material, voxyTbn, pos_screen, pos_view,");
+                result.add("                pos_scene + cameraPosition, normal, normal, dir_world, dir_world * voxyTbn,");
+                result.add("                parameters.lightMap.y, false);");
+                result.add("        }");
+                result.add("        #endif");
+                result.add("    }");
                 result.add("    #endif");
             }
             if (trimmed.equals("fragment_color.rgb = fragment_color.rgb * fog.a + fog.rgb;")) {
@@ -549,6 +642,130 @@ public final class VitrailVkCompat {
             }
         }
         return result == null ? lines : result;
+    }
+
+    //Complementary's LOD water reflects the End's sky with the volumetric light of its composite stage
+    // (reflectionBackground.glsl includes it for VOXY_TRANSLUCENT), which reads the entities' depth at
+    // texCoord, the full screen passes' screen coordinate. The LOD program has no texCoord, so in the End
+    // its LOD programs failed to build. It reads the same buffer at the fragment's screen position
+    private static List<String> patchComplementaryLodVolumetricLight(List<String> lines) {
+        for (String line : lines) {
+            if (line.contains("gl_FragCoord.xy / vec2(viewWidth, viewHeight)).r;")) {
+                return lines;//already patched (Vitrail hands cached lines through again)
+            }
+        }
+        List<String> result = new ArrayList<>(lines.size() + 4);
+        boolean patched = false;
+        for (String line : lines) {
+            if (!patched && line.trim().equals("float entityLinearDepth = texture2D(colortex13, texCoord).r;")) {
+                result.add("        #ifdef VOXY_TRANSLUCENT");
+                result.add(line.replace("texCoord", "gl_FragCoord.xy / vec2(viewWidth, viewHeight)"));
+                result.add("        #else");
+                result.add(line);
+                result.add("        #endif");
+                patched = true;
+                continue;
+            }
+            result.add(line);
+        }
+        return patched ? result : lines;
+    }
+
+    //BSL waves its lava surface up and down, and unlike its water (WavingWater in gbuffers_water) never
+    // eases the waves out towards the render distance for LODs, so the edge of the real lava rose and fell
+    // against the flat LOD lava: a wave shaped seam. The waves now ease out over the last chunk, as the water's
+    private static List<String> patchBslLavaWaves(List<String> lines) {
+        for (String line : lines) {
+            if (line.contains("VOXY_LAVA_WAVE_FADE")) {
+                return lines;//already patched (Vitrail hands cached lines through again)
+            }
+        }
+        List<String> result = new ArrayList<>(lines.size() + 8);
+        boolean inLava = false, patched = false;
+        for (String line : lines) {
+            String trimmed = line.trim();
+            if (!patched && trimmed.equals("float CalcLavaMove(vec3 worldPos) {")) {
+                result.add("#ifdef VOXY_LOD");
+                result.add("#define VOXY_LAVA_WAVE_FADE");
+                result.add("uniform float far;");
+                result.add("#endif");
+                inLava = true;
+            } else if (inLava && trimmed.startsWith("return wave * 0.0125")) {
+                String indent = line.substring(0, line.indexOf('r'));
+                result.add("#ifdef VOXY_LAVA_WAVE_FADE");
+                result.add(indent + "wave *= smoothstep(far + 4.0, far - 12.0, length(worldPos - cameraPosition));");
+                result.add("#endif");
+                inLava = false;
+                patched = true;
+            }
+            result.add(line);
+        }
+        return patched ? result : lines;
+    }
+
+    //Photon darkens its terrain by the vanilla ambient occlusion in the vertex colour, which Sodium gives
+    // lava too (the game itself never shades fluids so). Its LOD program has none, so the real lava was a
+    // shade darker than the LOD lava beside it, a seam at the render distance. Lava goes without, as the
+    // pack's leaves already do
+    private static List<String> patchPhotonLavaAo(List<String> lines) {
+        for (String line : lines) {
+            if (line.contains("/* MATERIAL_LAVA */")) {
+                return lines;//already patched (Vitrail hands cached lines through again)
+            }
+        }
+        List<String> result = new ArrayList<>(lines.size() + 4);
+        boolean patched = false;
+        for (String line : lines) {
+            result.add(line);
+            if (!patched && line.trim().equals("material_mask == 5 ? 1.0 : vanilla_ao; // no vanilla ao on leaves")) {
+                String indent = line.substring(0, line.indexOf('m')).replaceFirst("    $", "");
+                result.add("#ifdef VOXY_LOD");
+                result.add(indent + "vanilla_ao = material_mask == 39 /* MATERIAL_LAVA */ ? 1.0 : vanilla_ao;");
+                result.add("#endif");
+                patched = true;
+            }
+        }
+        return result;
+    }
+
+    //Photon's reflections march through the combined depth buffer (colortex15), which only its Voxy branch
+    // under Iris fills, so under Vitrail the LOD water found nothing in it and reflected only the sky: no
+    // shore or trees in it where the real water beside it showed them. The LOD water marches through
+    // Voxy's own depth instead (vxDepthTexOpaque, which carries the real chunks too) with Voxy's
+    // projection, as BSL's and Solas's LOD water do. That depth has no hand in it, and what lies before
+    // Voxy's near plane sits at 0, so only that ends a hit, not Photon's hand depth
+    private static List<String> patchPhotonLodWaterRaytracer(List<String> lines) {
+        for (String line : lines) {
+            if (line.contains("VOXY_TRANSLUCENT_AFTER_DEFERRED")) {
+                return lines;//already patched (Vitrail hands cached lines through again)
+            }
+        }
+        List<String> result = new ArrayList<>(lines.size() + 12);
+        boolean defines = false, hand = false;
+        for (String line : lines) {
+            String trimmed = line.trim();
+            if (!defines && trimmed.equals("#if defined SSRT_LOD")) {
+                result.add("#if defined VOXY_TRANSLUCENT_AFTER_DEFERRED");
+                result.add("#define SSRT_DEPTH_SAMPLER vxDepthTexOpaque");
+                result.add("#define SSRT_PROJECTION_MATRIX vxProj");
+                result.add("#define SSRT_PROJECTION_MATRIX_INVERSE vxProjInv");
+                result.add(line.replace("#if", "#elif"));
+                defines = true;
+                continue;
+            }
+            if (!hand && trimmed.equals("return hand_depth < final_depth && final_depth < 1.0;")) {
+                String indent = line.substring(0, line.indexOf('r'));
+                result.add("#ifdef VOXY_TRANSLUCENT_AFTER_DEFERRED");
+                result.add(indent + "return 0.0 < final_depth && final_depth < 1.0;");
+                result.add("#else");
+                result.add(line);
+                result.add("#endif");
+                hand = true;
+                continue;
+            }
+            result.add(line);
+        }
+        return defines && hand ? result : lines;
     }
 
     //Photon's border fog ends the land at the vanilla render distance unless LOD_MOD_ACTIVE (VOXY or
@@ -729,6 +946,27 @@ public final class VitrailVkCompat {
             if (line.trim().equals("viewVector = vec3(playerPos.x, playerPos.z, 0);")) {
                 line = line.replace("viewVector = vec3(playerPos.x, playerPos.z, 0);", "viewVector = tbnMatrix * viewPos;");
             }
+            //Complementary keeps colortex4 from frame to frame, the normal (and, from its deferred stage on,
+            // the fresnel) of each pixel for its reflections: its real terrain writes it, its deferred stage
+            // reads it back and writes it again. Under Iris the LODs never reach those stages, but under
+            // Vitrail they stand in the game's depth and do, and with nothing of theirs written there they
+            // took whatever normal was last left at that spot on screen, again every frame. A faint copy of
+            // old terrain stood over the LODs and smeared about as the camera moved. The LOD terrain writes
+            // its normal there as the real terrain does (a third draw buffer, see the voxy.json patch)
+            if (line.trim().equals("layout(location = 1) out vec4 gbufferData6;")) {
+                result.add(line);
+                result.add("layout(location = 2) out vec4 gbufferData4;");
+                continue;
+            }
+            if (line.trim().equals("gbufferData6 = vec4(smoothnessD, materialMask, skyLightFactor, 1.0);")) {
+                result.add(line);
+                result.add("    #if BLOCK_REFLECT_QUALITY >= 2 && RP_MODE != 0");
+                result.add("    gbufferData4 = vec4(mat3(gbufferModelViewInverse) * normalM, 1.0);");
+                result.add("    #else");
+                result.add("    gbufferData4 = vec4(0.0);");
+                result.add("    #endif");
+                continue;
+            }
             //Photon: a block its block.properties does not list has no id, which Vitrail (like Iris)
             // hands over as -1. As an unsigned number less 10000 that is still huge, so every such block
             // (stone, dirt, most of the land) became material 255, a hardcoded light source. The pack's
@@ -775,14 +1013,39 @@ public final class VitrailVkCompat {
     }
 
     private static List<String> patchMainFogGlsl(List<String> lines) {
-        List<String> result = new ArrayList<>(lines.size() + 8);
+        boolean netherFogPatched = false;//(Vitrail hands cached lines through again)
         for (String line : lines) {
+            netherFogPatched |= line.contains("lPos / float(VOXY_RENDER_DISTANCE)");
+        }
+        List<String> result = new ArrayList<>(lines.size() + 8);
+        for (int i = 0; i < lines.size(); i++) {
+            String line = lines.get(i);
             String l = line;
-            if (l.contains("#if !defined DISTANT_HORIZONS && !defined VOXY")) {
+            //The Nether's border fog is whole at the Nether view limit (256 blocks by default), and for half
+            // its weight at 256 whatever the limit, so every LOD lay in full fog. It also reads the LODs'
+            // distance off the game's depth, which stops at the game's far plane, so no limit short of
+            // limitless let them through. With the LODs out there it reaches their edge instead, as BSL's
+            // Nether fog does for Voxy (the limit still bounds the Nether storm and the bloom fog)
+            if (!netherFogPatched && l.trim().equals("float farM = min(renderDistance, NETHER_VIEW_LIMIT); // consistency9023HFUE85JG")
+                    && i + 2 < lines.size()
+                    && lines.get(i + 1).trim().equals("float fog = lPos / farM;")
+                    && lines.get(i + 2).trim().equals("fog = mix(fog, min1(lPos / min(farM, 256.0)), 0.5);")) {
+                String indent = l.substring(0, l.indexOf('f'));
+                result.add("            #ifdef VOXY_LOD");
+                result.add(indent + "float fog = lPos / float(VOXY_RENDER_DISTANCE);");
+                result.add("            #else");
+                result.add(l);
+                result.add(lines.get(i + 1));
+                result.add(lines.get(i + 2));
+                result.add("            #endif");
+                i += 2;
+                continue;
+            }
+            if (l.contains("#if !defined DISTANT_HORIZONS && !defined VOXY") && !l.contains("VOXY_LOD")) {
                 l = l.replace("#if !defined DISTANT_HORIZONS && !defined VOXY",
                         "#if !defined DISTANT_HORIZONS && !defined VOXY && !defined VOXY_LOD");
             }
-            if (l.contains("#if defined DISTANT_HORIZONS || defined VOXY")) {
+            if (l.contains("#if defined DISTANT_HORIZONS || defined VOXY") && !l.contains("VOXY_LOD")) {
                 l = l.replace("#if defined DISTANT_HORIZONS || defined VOXY",
                         "#if defined DISTANT_HORIZONS || defined VOXY || defined VOXY_LOD");
             }
