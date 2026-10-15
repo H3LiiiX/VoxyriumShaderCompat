@@ -1,9 +1,10 @@
-# Voxyrium
+# Voxyrium with support for Vitrail Shaders
 
-A fork of Voxy with native OpenGL/Vulkan renderers and an experimental Blaze3D compatibility renderer. Select the renderer from Voxy's Rendering settings.
+A fork of Voxy with support for Vitrail Shaders and native OpenGL/Vulkan and experimental Blaze3D rendering. Select the renderer from Voxy's Rendering settings.
 
 ## Changes
 
+* **Vitrail shader support**, tested on high presets with BSL, Complementary, Photon and Solas. The compatibility changes were done by Claude so it is likely not perfect and will contain bugs. However for most players who just stick to the presets there should not be any noticeable issues. Please report any issues you find.
 * **Full Vulkan support**, based on [MCRcortex/voxy#614](https://github.com/MCRcortex/voxy/pull/614) by `cochcoder`.
 * **Intel Mac support** in addition to Apple Silicon.
 * Additional **MoltenVK-specific fixes**.
