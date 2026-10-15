@@ -206,6 +206,8 @@ public final class VitrailVkCompat {
             return patchWavingBlocksGlsl(lines);
         } else if (normPath.endsWith("lib/lighting/shadowSampling.glsl")) {
             return patchShadowSamplingGlsl(lines);
+        } else if (normPath.endsWith("lib/lighting/mainLighting.glsl")) {
+            return patchMainLightingGlsl(lines);
         } else if (normPath.endsWith("lib/misc/worldOutline.glsl")) {
             return patchWorldOutlineGlsl(lines);
         } else if (normPath.endsWith("lib/materials/specificMaterials/translucents/water.glsl")) {
@@ -855,6 +857,37 @@ public final class VitrailVkCompat {
                         "#if defined DISTANT_HORIZONS || defined VOXY || defined VOXY_LOD");
             }
             result.add(line);
+        }
+        return result;
+    }
+
+    //The shadow map only holds the real chunks, the LODs never cast into it. Out at the edge of the real
+    // chunks the light's path from a sea floor up through the water leaves them before it reaches the
+    // surface, the water it crosses out there is missing from the map, and the floor took the full
+    // untinted sunlight of a block with nothing over it: a strip of brightly lit sea floor along the
+    // edge, under the darker LOD floor beyond it (lit from the sky light alone) and the water-tinted
+    // floor this side of it. A surface whose path to the light leaves the real chunks is eased onto
+    // that same sky light estimate, as the pack does past its shadow distance. The path's length in
+    // the water comes from the sky light, which loses a level for each block of water over it
+    private static List<String> patchMainLightingGlsl(List<String> lines) {
+        for (String line : lines) {
+            if (line.contains("voxyLightPath")) {
+                return lines;//already patched (Vitrail hands cached lines through again)
+            }
+        }
+        List<String> result = new ArrayList<>(lines.size() + 10);
+        for (String line : lines) {
+            result.add(line);
+            if (line.trim().equals("float shadowLength = shadowDistance * 0.9166667 - lViewPos; //consistent08JJ622")) {
+                result.add("                    #if defined VOXY_LOD && !defined VOXY");
+                result.add("                        {");
+                result.add("                            vec3 voxyLightPath = mat3(gbufferModelViewInverse) * lightVec;");
+                result.add("                            float voxyWaterDepth = 15.0 * (1.0 - lightmap.y);");
+                result.add("                            vec2 voxyLightExit = playerPos.xz + voxyLightPath.xz * (voxyWaterDepth / max(voxyLightPath.y, 0.05));");
+                result.add("                            shadowLength = min(shadowLength, far - length(voxyLightExit));");
+                result.add("                        }");
+                result.add("                    #endif");
+            }
         }
         return result;
     }
