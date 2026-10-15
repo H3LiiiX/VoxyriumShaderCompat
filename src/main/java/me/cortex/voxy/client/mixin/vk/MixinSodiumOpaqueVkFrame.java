@@ -47,9 +47,11 @@ public class MixinSodiumOpaqueVkFrame {
 package me.cortex.voxy.client.mixin.vk;
 
 import com.mojang.blaze3d.textures.GpuSampler;
+import me.cortex.voxy.client.compat.vitrail.VitrailVkCompat;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.client.core.vk.MinecraftVkHost;
 import me.cortex.voxy.client.core.vk.MinecraftVkHostAdapter;
+import me.cortex.voxy.client.core.vk.VkFrameCapture;
 import me.cortex.voxy.common.Logger;
 import net.caffeinemc.mods.sodium.client.render.SodiumWorldRenderer;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
@@ -66,10 +68,13 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 // device too — injects at the HEAD of renderGroup and calls
 // CallbackInfo.cancel(), so the vanilla RETURN (and every @At("TAIL") injector)
 // is bypassed. Sodium instead draws through SodiumWorldRenderer#drawChunkLayer.
-// We therefore trigger Voxy's frame at the TAIL of drawChunkLayer for the
+// We therefore take Voxy's frame at the TAIL of drawChunkLayer for the
 // OPAQUE group: Sodium's opaque terrain has just been drawn, its render pass
 // is closed, the frame command buffer is recording, and MC's depth buffer
 // holds vanilla terrain — exactly the state Voxy's VK frame needs.
+//
+//A Vitrail shaderpack keeps its level pass open here and wants the LODs in its own targets, so its
+// frame is only captured, and recorded at its stage (MixinVitrailEngineStages) as on 26.3
 @Mixin(value = SodiumWorldRenderer.class, remap = false)
 public class MixinSodiumOpaqueVkFrame {
 
@@ -77,13 +82,16 @@ public class MixinSodiumOpaqueVkFrame {
     private void voxy$renderVkFrame(ChunkSectionLayerGroup group, ChunkRenderMatrices matrices,
                                     double x, double y, double z, GpuSampler sampler, CallbackInfo ci) {
         if (group != ChunkSectionLayerGroup.OPAQUE) return;
-        if (!(MinecraftVkHost.get() instanceof MinecraftVkHostAdapter adapter)) return;
+        if (!(MinecraftVkHost.get() instanceof MinecraftVkHostAdapter)) return;
 
         var renderer = IVoxyRenderSystemHolder.getNullable();
         if (renderer == null || renderer.vkCore == null) return;
 
         try {
-            renderer.vkCore.renderFrame(group.outputTarget(), adapter, matrices, x, y, z);
+            VkFrameCapture.capture(group.outputTarget(), matrices, x, y, z);
+            if (!VitrailVkCompat.isDrawingPack()) {
+                VkFrameCapture.tryRenderPendingVkFrame();
+            }
         } catch (Throwable t) {
             //Never take down MC's frame; log loudly instead
             Logger.error("Voxy VK frame failed", t);

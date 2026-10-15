@@ -1047,7 +1047,10 @@ public class VkTerrainRenderer {
                 long lavaSampler = useTerrainSampler
                         ? ((com.mojang.renderpearl.backend.vulkan.VulkanGpuSampler) terrainSampler).vkSampler() : this.packWaterSampler;
 //? else
-                long lavaSampler = this.packWaterSampler;
+                //(26.2's sampler cannot say it was closed; Vitrail keeps the ones it hands out open)
+                var terrainSampler = VitrailVoxyPack.terrainSampler();
+                long lavaSampler = terrainSampler instanceof com.mojang.blaze3d.vulkan.VulkanGpuSampler vk
+                        ? vk.vkSampler() : this.packWaterSampler;
 //? endif
                 this.bindFluidSprite(pipeline, b, cmd, LAVA_STILL, lavaSampler);
             } else if (pipeline == this.terrainOpaque) {
