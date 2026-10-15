@@ -172,6 +172,16 @@ public final class VoxyPackPatch {
             }
         }
 
+        //A pack written against Iris may read OpenGL's fixed-function fog (Solas 3.8's modded fog reads
+        // gl_Fog.start and gl_Fog.end), which Vulkan GLSL does not have. Vitrail answers it for the pack's
+        // own programs as its uniform of_Fog, and so is it answered here (patchSource renames the reads)
+        if ((GL_FOG.matcher(opaque).find() || (translucent != null && GL_FOG.matcher(translucent).find()))
+                && !uniforms.contains(OF_FOG)) {
+            uniforms.add(OF_FOG);
+            declaredTypes = new HashMap<>(declaredTypes);
+            declaredTypes.put(OF_FOG, OF_FOG_TYPE);
+        }
+
         int[] opaqueBuffers = intArray(json, "opaqueDrawBuffers", new int[]{0});
         int[] translucentBuffers = intArray(json, "translucentDrawBuffers", new int[]{0});
         checkDrawBuffers("opaque", opaqueBuffers);
@@ -323,10 +333,17 @@ public final class VoxyPackPatch {
         //Words Vulkan GLSL reserves for its separate sampler types and OpenGL leaves free, which a pack
         // may use as names (Photon's bicubic filter takes a "sampler2D sampler")
         source = VK_RESERVED.matcher(source).replaceAll("voxy_$1");
+        source = GL_FOG.matcher(source).replaceAll(OF_FOG);
         return FRAG_COORD.matcher(source).replaceAll("voxy_FragCoord");
     }
 
     private static final Pattern VK_RESERVED = Pattern.compile("\\b(sampler|samplerShadow)\\b");
+
+    private static final Pattern GL_FOG = Pattern.compile("\\bgl_Fog\\b");
+    private static final String OF_FOG = "of_Fog";
+    private static final String OF_FOG_TYPE = "OfFog";
+    //Vitrail's own declaration of it (its Emitter), which its uniform block writes as std140
+    private static final String OF_FOG_STRUCT = "struct OfFog { vec4 color; float density; float start; float end; float scale; };\n";
 
     //One plain declaration on its own line: no layout, no initialiser, no list
     private static final Pattern OWN_UNIFORM_LINE = Pattern.compile("\\s*uniform\\s+(\\w+)\\s+(\\w+)\\s*;\\s*(?://.*)?");
@@ -362,6 +379,9 @@ public final class VoxyPackPatch {
             b.append("    ").append(m[0]).append(' ').append(name).append(";\n");
         }
         b.append("};\n");
+        if (this.packUniforms.contains(OF_FOG)) {
+            b.append(OF_FOG_STRUCT);
+        }
         if (!this.packUniforms.isEmpty()) {
             b.append("layout(binding = ").append(PACK_UBO_BINDING).append(", std140) uniform VoxyPackUniforms {\n");
             for (String name : this.packUniforms) {
