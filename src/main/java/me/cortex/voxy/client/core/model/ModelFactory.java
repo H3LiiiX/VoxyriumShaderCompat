@@ -536,6 +536,11 @@ public class ModelFactory {
             //TODO: make this an option, basicly if the face is really close, it occludes otherwise it doesnt
             occludesFace &= offset < 0.1;//If the face is rendered far away from the other face, then it doesnt occlude
 
+            //A fluid is baked full height, but its top is drawn lower (pinned to 8/9 of a block, or to its
+            // corner heights, quad_util.glsl), so only its bottom face covers the face beside it. Opaque lava
+            // occluding with its sides hid the top of every block standing in it, which floated over the lava
+            occludesFace &= !isFluid || face == 0;
+
             if (occludesFace) {
                 occludesFace &= ((float)writeCount)/(MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE) > 0.9;// only occlude if the face covers more than 90% of the face
             }
