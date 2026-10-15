@@ -14,6 +14,33 @@ dependency_spec.loader.exec_module(UpdateProfileDependencies)
 
 
 class JsonCompatibilityTests(unittest.TestCase):
+    def test_26_targets_share_baseline_but_have_separate_builds(self):
+        entries = [entry for entry in Build_CompatibilityMatrix.MATRIX
+                   if any(version in ('26.2', '26.3') for version in entry['versions'])]
+        self.assertEqual(len(entries), 2)
+        self.assertEqual({entry['branch'] for entry in entries}, {'dev'})
+        self.assertEqual({entry['expected'] for entry in entries}, {'26.2'})
+        self.assertEqual({entry['build_version'] for entry in entries}, {'26.2', '26.3'})
+        self.assertEqual(len({entry['key'] for entry in entries}), 2)
+        for entry in entries:
+            self.assertEqual(entry['versions'], [entry['build_version']])
+
+    def test_built_jar_selects_target_and_preserves_legacy_layout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            jars = []
+            for version in ('26.2', '26.3'):
+                jar = root / f'build/minecraft-{version}/libs/voxy-mc{version}.jar'
+                jar.parent.mkdir(parents=True)
+                jar.write_bytes(b'target')
+                jars.append(jar)
+            legacy = root / 'build/libs/voxy-old.jar'
+            legacy.parent.mkdir(parents=True)
+            legacy.write_bytes(b'legacy')
+            self.assertEqual(Build_CompatibilityMatrix.built_jar(root, '26.2'), jars[0])
+            self.assertEqual(Build_CompatibilityMatrix.built_jar(root, '26.3'), jars[1])
+            self.assertEqual(Build_CompatibilityMatrix.built_jar(root, '1.21.11'), legacy)
+
     def test_dependency_overrides_are_parsed_as_exact_constraints(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "dependency-overrides.txt"

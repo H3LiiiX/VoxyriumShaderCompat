@@ -1,6 +1,10 @@
 package me.cortex.voxy.client.core.backend.blaze3d;
 
+//? if MC_26_3
 import com.mojang.renderpearl.api.pipeline.RenderPipeline;
+//? else
+import com.mojang.blaze3d.pipeline.RenderPipeline;
+//? endif
 import com.mojang.blaze3d.systems.RenderSystem;
 import net.minecraft.resources.Identifier;
 

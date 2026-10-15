@@ -1,3 +1,4 @@
+//? if MC_26_3
 package me.cortex.voxy.common;
 
 import net.fabricmc.loader.api.FabricLoader;
@@ -33,3 +34,4 @@ public class MixinConfig implements IMixinConfigPlugin {
         return true;
     }
 }
+//? endif

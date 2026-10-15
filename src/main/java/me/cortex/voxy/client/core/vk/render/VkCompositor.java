@@ -1,6 +1,10 @@
 package me.cortex.voxy.client.core.vk.render;
 
+//? if MC_26_3
 import com.mojang.renderpearl.api.textures.GpuTextureView;
+//? else
+import com.mojang.blaze3d.textures.GpuTextureView;
+//? endif
 import me.cortex.voxy.client.compat.vitrail.VitrailVkCompat;
 import me.cortex.voxy.client.compat.vitrail.VitrailVoxyPack;
 import me.cortex.voxy.client.config.VoxyConfig;

@@ -1,0 +1,120 @@
+// Both releases compile the same source tree. Only API differences are conditional.
+def targets = [
+        '26.2': [loader_version: '0.19.3', fabric_api_version: '0.152.2+26.2',
+                 sodium_version_modrinth: 'mc26.2-0.9.2-alpha.4-fabric', sodium_extra_allows: '0.9.1',
+                 modmenu_version: '20.0.0', lithium_version: 'mc26.2-0.25.1-fabric',
+                 iris_version: '1.11.2+26.2-fabric', lwjgl: '3.4.1'],
+        '26.3': [loader_version: '0.19.5', fabric_api_version: '0.160.5+26.3',
+                 sodium_version_modrinth: 'mc26.3-0.9.2-fabric', sodium_extra_allows: '',
+                 modmenu_version: '21.0.0-beta.1', lithium_version: 'mc26.3-0.26.1-fabric',
+                 'compileOnly.iris_version': '1.11.7+26.3-fabric', lwjgl: '3.4.3']
+]
+def minecraftTarget = project.minecraft_version.toString()
+def selected = targets[minecraftTarget]
+if (selected == null) {
+    throw new GradleException("Unsupported Minecraft target '${minecraftTarget}'; choose 26.2 or 26.3.")
+}
+selected.each { key, value ->
+    // Keep explicit -P dependency overrides, including smartDependency's modifiers.
+    if (!gradle.startParameter.projectProperties.containsKey(key)) {
+        project.ext.set(key, value)
+    }
+}
+project.ext.lwjglVersion = selected.lwjgl
+
+// Switching targets cannot leave compiled classes or resources from the other API.
+layout.buildDirectory = layout.projectDirectory.dir("build/minecraft-${minecraftTarget}")
+base.archivesName = "${project.archives_base_name}-mc${minecraftTarget}"
+
+// Directives are deliberately limited to the two supported APIs. Preserve line
+// numbers in generated files so compiler diagnostics point back to src/.
+def preprocess = { String text, String name ->
+    def stack = []
+    boolean enabled = true
+    def result = new StringBuilder()
+    text.readLines().eachWithIndex { line, index ->
+        def marker = line =~ /^\s*(?:\/\/\?|#\?)\s*(if|else|endif)(?:\s+(\S+))?\s*$/
+        if (marker.matches()) {
+            def operation = marker[0][1]
+            def condition = marker[0][2]
+            if (operation == 'if') {
+                if (!(condition in ['MC_26_2', 'MC_26_3'])) {
+                    throw new GradleException("${name}:${index + 1}: unknown condition '${condition}'")
+                }
+                boolean matches = condition == (minecraftTarget == '26.3' ? 'MC_26_3' : 'MC_26_2')
+                stack.add([parent: enabled, matches: matches, otherwise: false])
+                enabled = enabled && matches
+            } else {
+                if (condition != null || stack.isEmpty()) {
+                    throw new GradleException("${name}:${index + 1}: unexpected ${operation}")
+                }
+                def frame = stack.last()
+                if (operation == 'else') {
+                    if (frame.otherwise) throw new GradleException("${name}:${index + 1}: duplicate else")
+                    frame.otherwise = true
+                    enabled = frame.parent && !frame.matches
+                } else {
+                    enabled = frame.parent
+                    stack.removeLast()
+                }
+            }
+            result.append('\n')
+        } else if (line.trim().startsWith('//?') || line.trim().startsWith('#?')) {
+            throw new GradleException("${name}:${index + 1}: malformed conditional directive")
+        } else {
+            result.append(enabled ? line : '').append('\n')
+        }
+    }
+    if (!stack.isEmpty()) throw new GradleException("${name}: missing endif")
+    return result.toString()
+}
+
+// Loom reads the access widener during configuration, before Java tasks run.
+def accessWidener = file(".gradle/voxy-api/${minecraftTarget}/voxy.accesswidener")
+def accessText = preprocess(file('src/main/resources/voxy.accesswidener').getText('UTF-8'), 'voxy.accesswidener')
+if (!accessWidener.exists() || accessWidener.getText('UTF-8') != accessText) {
+    accessWidener.parentFile.mkdirs()
+    accessWidener.setText(accessText, 'UTF-8')
+}
+loom.accessWidenerPath = accessWidener
+
+def generated = layout.buildDirectory.dir('generated/minecraft').get().asFile
+def roots = ['main/java', 'main/resources', 'pipelineTest/java']
+def prepare = tasks.register('prepareMinecraftSources') {
+    group = 'build setup'
+    description = 'Selects the Java, shader and mixin API sections for the Minecraft target.'
+    inputs.property('minecraft', minecraftTarget)
+    inputs.file('gradle/minecraft-versions.gradle')
+    roots.each { inputs.dir("src/${it}") }
+    outputs.dir(generated)
+    doLast {
+        delete(generated)
+        roots.each { root ->
+            fileTree("src/${root}").files.each { source ->
+                def relative = file("src/${root}").toPath().relativize(source.toPath()).toString()
+                def destination = new File(generated, "${root}/${relative}")
+                if (source.name ==~ /.*\.(java|json|accesswidener|vsh|fsh|glsl|frag|vert|comp)$/) {
+                    def processed = preprocess(source.getText('UTF-8'), "${root}/${relative}")
+                    // A class wholly exclusive to the other release must not be compiled.
+                    if (!processed.trim().isEmpty()) {
+                        destination.parentFile.mkdirs()
+                        destination.setText(processed, 'UTF-8')
+                    }
+                } else {
+                    destination.parentFile.mkdirs()
+                    destination.bytes = source.bytes
+                }
+            }
+        }
+    }
+}
+sourceSets.main.java.setSrcDirs([new File(generated, 'main/java')])
+sourceSets.main.resources.setSrcDirs([new File(generated, 'main/resources')])
+tasks.named('compileJava') { dependsOn(prepare) }
+tasks.named('processResources') { dependsOn(prepare) }
+
+// Called after the custom test source set has been declared in build.gradle.
+project.ext.configureMinecraftPipelineTests = {
+    sourceSets.blaze3dPipelineTest.java.setSrcDirs([new File(generated, 'pipelineTest/java')])
+    tasks.named('compileBlaze3dPipelineTestJava') { dependsOn(prepare) }
+}

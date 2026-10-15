@@ -1,8 +1,14 @@
 package me.cortex.voxy.client.core;
 
+//? if MC_26_2
+import com.mojang.blaze3d.pipeline.DepthStencilState;
+import com.mojang.blaze3d.platform.CompareOp;
+//? endif
 import com.mojang.blaze3d.systems.RenderSystem;
+//? if MC_26_3
 import com.mojang.renderpearl.api.pipeline.CompareOp;
 import com.mojang.renderpearl.api.pipeline.DepthStencilState;
+//? endif
 import me.cortex.voxy.client.core.gl.shader.Shader;
 import me.cortex.voxy.client.core.util.IrisUtil;
 import me.cortex.voxy.client.iris.IGetIrisVoxyPipelineData;
@@ -60,8 +66,12 @@ public record RenderProperties(boolean isZero2One, boolean isReverseZ, boolean u
     }
 
     private static boolean useReverseZ() {
+//? if MC_26_3
         //if (IrisUtil.irisShaderPackEnabled()) return false;
         return DepthStencilState.DEFAULT.depthTest().equals(CompareOp.GREATER_THAN_OR_EQUAL);
+//? else
+        return IrisUtil.irisShaderPackEnabled()?false:DepthStencilState.DEFAULT.depthTest().equals(CompareOp.GREATER_THAN_OR_EQUAL);
+//? endif
     }
 
     public static RenderProperties getRenderProperties() {

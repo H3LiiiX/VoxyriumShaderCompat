@@ -1,7 +1,12 @@
 package me.cortex.voxy.client.core.model.bakery;
 
+//? if MC_26_3
 import com.mojang.renderpearl.backend.opengl.GlTexture;
 import com.mojang.renderpearl.api.textures.GpuTexture;
+//? else
+import com.mojang.blaze3d.opengl.GlTexture;
+import com.mojang.blaze3d.textures.GpuTexture;
+//? endif
 
 import static org.lwjgl.opengl.ARBDirectStateAccess.glGetTextureImage;
 import static org.lwjgl.opengl.GL11.*;

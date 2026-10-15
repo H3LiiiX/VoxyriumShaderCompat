@@ -12,13 +12,13 @@ A fork of Voxy with native OpenGL/Vulkan renderers and an experimental Blaze3D c
 
 ## Blaze3D Renderer (Experimental)
 
-The alternative renderer uses only Minecraft 26.2's public **Blaze3D API**. It should therefore run on any device capable of Minecraft's minimum graphics requirements, including **OpenGL 3.3** hardware.
+The alternative renderer uses Minecraft's public **Blaze3D API** in 26.2 and 26.3. It should therefore run on any device capable of Minecraft's minimum graphics requirements, including **OpenGL 3.3** hardware.
 
 Its goal is to reproduce Voxy's rendering and performance as closely as possible while remaining completely independent of the underlying graphics API.
 
 There is, however, a fundamental performance ceiling: Blaze3D does not expose enough of the GPU to reproduce Voxy's native GPU-driven pipeline.
 
-| GPU feature                       | Blaze3D 26.2 | Limitation                                                            |
+| GPU feature                       | Blaze3D 26.2 / 26.3 | Limitation                                                            |
 | --------------------------------- | ------------ | --------------------------------------------------------------------- |
 | Vertex/index/uniform/copy buffers | ✅            | Fully usable                                                          |
 | Indirect command buffers          | ⚠️           | `drawIndexedIndirect(...)`, but one command per call                  |
@@ -54,6 +54,28 @@ The Blaze3D backend should therefore be considered a **portable compatibility re
 
 ## Compatibility Builds and Testing
 
+Minecraft **26.2 and 26.3 share the `dev` branch**. The default target is 26.2;
+select 26.3 without changing the source baseline or dependency properties:
+
+```bash
+./gradlew -Pminecraft_version=26.2 build
+./gradlew -Pminecraft_version=26.3 build
+```
+
+Java 25 is required for both. Each target has its own output directory,
+`build/minecraft-26.2/` or `build/minecraft-26.3/`, and a JAR named for its
+Minecraft version. The compatibility script selects the same branch for both:
+
+```bash
+python3 scripts/Build-CompatibilityMatrix.py --action compile --versions 26.2 26.3
+```
+
+API differences in Java, shaders, mixin declarations and the access widener use
+`//? if MC_26_3`, `//? else`, `//? endif` sections (`#?` in the access widener).
+`MC_26_2` selects the older API. Gradle preprocesses these sections before
+compiling and packaging; edit the shared files in `src/`, not generated files.
+Dependencies for each target are declared in `gradle/minecraft-versions.gradle`.
+
 The scripts in [`scripts/`](scripts/) make it easier to backport new game features continuously to the Minecraft **1.20.x and 1.21.x** branches. They build the selected branch/version combinations, prepare matching Fabric test profiles, and keep the runtime dependencies aligned so changes can be checked across the supported versions as they are developed.
 
 ### Getting started
@@ -66,7 +88,7 @@ macOS:   scripts/Run-Scripts-macOS.command
 Other:   python3 scripts/Run-Scripts.py
 ```
 
-The menu launches the available capitalized Python scripts. Python 3 and Git are required; compilation also requires the appropriate JDKs (Java 17 for older 1.20.x targets and Java 21 for newer targets). `InstallJdkVersions.py` can install the toolchains used by the compatibility builds. The build/profile scripts can also be run directly with Python; use `--help` to see their options.
+The menu launches the available capitalized Python scripts. Python 3 and Git are required; compilation also requires the appropriate JDKs (Java 17 for older 1.20.x targets, Java 21 for newer 1.20.x and 1.21.x targets, and Java 25 for 26.x). `InstallJdkVersions.py` can install the toolchains used by the compatibility builds. The build/profile scripts can also be run directly with Python; use `--help` to see their options.
 
 ### Main workflows
 

@@ -1,6 +1,8 @@
 package me.cortex.voxy.client.core.rendering.util;
 
+//? if MC_26_3
 import com.mojang.renderpearl.backend.opengl.GlTexture;
+//? endif
 import net.minecraft.client.Minecraft;
 
 import static org.lwjgl.opengl.GL11C.*;
@@ -28,6 +30,10 @@ public class LightMapHelper {
     }
 
     public static int getLightmapTextureId() {
+//? if MC_26_3
         return ((GlTexture)(Minecraft.getInstance().gameRenderer.levelLightmap().texture())).glId();
+//? else
+        return ((com.mojang.blaze3d.opengl.GlTexture)(Minecraft.getInstance().gameRenderer.levelLightmap().texture())).glId();
+//? endif
     }
 }

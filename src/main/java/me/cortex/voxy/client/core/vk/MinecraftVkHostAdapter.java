@@ -1,6 +1,10 @@
 package me.cortex.voxy.client.core.vk;
 
+//? if MC_26_3
 import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
+//? else
+import com.mojang.blaze3d.vulkan.VulkanDevice;
+//? endif
 import me.cortex.voxy.client.mixin.vk.AccessorVulkanCommandEncoder;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkDevice;

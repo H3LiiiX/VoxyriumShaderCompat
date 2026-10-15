@@ -46,6 +46,7 @@ public abstract class MixinLevelRenderer implements IVoxyRenderSystemHolder {
         }
     }
 
+//? if MC_26_3
     @Inject(method = "executeSolid", at = @At("TAIL"))
     private void voxy$afterExecuteSolid(net.minecraft.client.renderer.chunk.ChunkSectionsToRender chunks,
                                         net.minecraft.client.renderer.feature.FeatureRenderDispatcher.PreparedFrame features,
@@ -91,6 +92,7 @@ public abstract class MixinLevelRenderer implements IVoxyRenderSystemHolder {
                                            CallbackInfo ci) {
         me.cortex.voxy.client.core.vk.VkFrameCapture.tryRenderPendingVkFrame();
     }
+//? endif
 
     /*
     @Override

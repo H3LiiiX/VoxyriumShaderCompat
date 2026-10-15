@@ -1,6 +1,10 @@
 package me.cortex.voxy.client;
 
+//? if MC_26_3
 import com.mojang.renderpearl.api.device.GpuDevice;
+//? else
+import com.mojang.blaze3d.systems.GpuDevice;
+//? endif
 import me.cortex.voxy.client.compat.IrisBackendCompat;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;

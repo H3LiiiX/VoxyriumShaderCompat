@@ -4,6 +4,9 @@ on: [ workflow_dispatch ]
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        minecraft: ['26.2', '26.3']
 
     steps:
       - name: Checkout sources
@@ -22,11 +25,11 @@ jobs:
           cache-cleanup: always
 
       - name: Gradle build
-        run: ./gradlew build
+        run: ./gradlew -Pminecraft_version=${{ matrix.minecraft }} build
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: voxy-artifacts
-          path: build/libs/*.jar
+          name: voxy-artifacts-mc${{ matrix.minecraft }}
+          path: build/**/libs/*.jar
           archive: false

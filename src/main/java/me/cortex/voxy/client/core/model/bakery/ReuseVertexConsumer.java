@@ -7,7 +7,9 @@ import net.minecraft.client.model.geom.builders.UVPair;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
 import net.minecraft.client.renderer.texture.MipmapStrategy;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
+//? if MC_26_3
 import net.minecraft.core.Direction;
+//? endif
 import org.lwjgl.system.MemoryUtil;
 
 public final class ReuseVertexConsumer implements VertexConsumer {
@@ -84,16 +86,23 @@ public final class ReuseVertexConsumer implements VertexConsumer {
     }
 
     @Override
+//? if MC_26_3
     public ReuseVertexConsumer setUv3(float u, float v) { return this; }
 
     @Override
+//? endif
     public ReuseVertexConsumer setNormal(float x, float y, float z) {
         return this;
     }
 
     @Override
+//? if MC_26_3
     public ReuseVertexConsumer setLineWidth(float f) {
         return this;
+//? else
+    public VertexConsumer setLineWidth(float f) {
+        return null;
+//? endif
     }
 
     public ReuseVertexConsumer quad(BakedQuad quad) {
@@ -108,8 +117,12 @@ public final class ReuseVertexConsumer implements VertexConsumer {
     }
 
     public ReuseVertexConsumer quad(BakedQuad quad, int metadata) {
+//? if MC_26_3
         //TODO: FIXME: this is wrong, e.g. stuff becomes conditionally shaded, e.g. the shade comes from the override pretty sure
         this.anyShaded |= quad.materialInfo().shadeDirectionOverride() == null;
+//? else
+        this.anyShaded |= quad.materialInfo().shade();
+//? endif
         this.anyDarkendTex |= quad.materialInfo().sprite().contents().mipmapStrategy == MipmapStrategy.DARK_CUTOUT;
         this.ensureCanPut();
         for (int i = 0; i < 4; i++) {

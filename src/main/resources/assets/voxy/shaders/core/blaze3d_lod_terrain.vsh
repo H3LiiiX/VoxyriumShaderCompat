@@ -1,19 +1,34 @@
 #version 330
+//? if MC_26_3
+#extension GL_ARB_separate_shader_objects : require
+#include <voxy:blaze3d_sodium_coverage.glsl>
+//? else
 #moj_import <voxy:blaze3d_sodium_coverage.glsl>
+//? endif
 
 layout(std140) uniform DynamicTransforms {
     mat4 ModelViewMat;
+//? if MC_26_3
+    mat4 TextureMat;
+//? endif
     vec4 ColorModulator;
     vec3 ModelOffset;
+//? if MC_26_2
     mat4 TextureMat;
+//? endif
 };
 layout(std140) uniform Projection {
     mat4 ProjMat;
 };
 
 // Only the original Cortex quad advances per instance; metadata is shared on the GPU.
+//? if MC_26_3
+layout(location = 0) in vec2 Corner;
+layout(location = 1) in uvec2 QuadData;
+//? else
 in vec2 Corner;
 in uvec2 QuadData;
+//? endif
 layout(std140) uniform VoxySection {
     vec4 SectionOriginScale;
 };
@@ -29,6 +44,15 @@ uniform sampler2D VoxyVisibility;
 
 uniform sampler2D Sampler2;
 
+//? if MC_26_3
+layout(location = 0) out vec2 texCoord0;
+layout(location = 1) flat out vec4 tintColor;
+layout(location = 2) flat out vec4 vertexLighting;
+layout(location = 3) flat out int modelId;
+layout(location = 4) flat out int quadFlags;
+layout(location = 5) out float sphericalDistance;
+layout(location = 6) out vec2 worldXZ;
+//? else
 out vec2 texCoord0;
 flat out vec4 tintColor;
 flat out vec4 vertexLighting;
@@ -36,6 +60,7 @@ flat out int modelId;
 flat out int quadFlags;
 out float sphericalDistance;
 out vec2 worldXZ;
+//? endif
 
 float fluidHeightOffset(int face, int axis, ivec2 corner, uint heights) {
     int index = -1;

@@ -1,7 +1,13 @@
 package me.cortex.voxy.client.mixin.minecraft;
 
+//? if MC_26_2
+
+import com.mojang.blaze3d.systems.GpuDevice;
+//? endif
 import com.mojang.blaze3d.systems.RenderSystem;
+//? if MC_26_3
 import com.mojang.renderpearl.api.device.GpuDevice;
+//? endif
 import me.cortex.voxy.client.VoxyClient;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;

@@ -1,6 +1,10 @@
 package me.cortex.voxy.client.core.vk.render;
 
+//? if MC_26_3
 import com.mojang.renderpearl.api.textures.GpuTextureView;
+//? else
+import com.mojang.blaze3d.textures.GpuTextureView;
+//? endif
 import me.cortex.voxy.client.compat.vitrail.VitrailVoxyPack;
 import me.cortex.voxy.client.compat.vitrail.VoxyPackPatch;
 import me.cortex.voxy.client.config.VoxyConfig;
@@ -1036,11 +1040,16 @@ public class VkTerrainRenderer {
                 //Read as the pack's real lava is: with a mip picked whole (where that sampler blends two)
                 // the LOD lava came out more averaged than the real lava beside it, and through the pack's
                 // gamma and emission an averaged lava texture is darker and redder than the real one
+//? if MC_26_3
                 var terrainSampler = VitrailVoxyPack.terrainSampler();
                 boolean useTerrainSampler = terrainSampler instanceof com.mojang.renderpearl.backend.vulkan.VulkanGpuSampler vk
                         && !vk.isClosed();
-                this.bindFluidSprite(pipeline, b, cmd, LAVA_STILL, useTerrainSampler
-                        ? ((com.mojang.renderpearl.backend.vulkan.VulkanGpuSampler) terrainSampler).vkSampler() : this.packWaterSampler);
+                long lavaSampler = useTerrainSampler
+                        ? ((com.mojang.renderpearl.backend.vulkan.VulkanGpuSampler) terrainSampler).vkSampler() : this.packWaterSampler;
+//? else
+                long lavaSampler = this.packWaterSampler;
+//? endif
+                this.bindFluidSprite(pipeline, b, cmd, LAVA_STILL, lavaSampler);
             } else if (pipeline == this.terrainOpaque) {
                 this.bindFluidSprite(pipeline, b, cmd, LAVA_STILL, this.packWaterSampler);
             }

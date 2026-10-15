@@ -8,11 +8,13 @@ def INCLUDE_OTHER_ARCHS = "true".equalsIgnoreCase(project.findProperty("includeO
 
 def isInGHA = System.getenv("GITHUB_ACTIONS") == "true"
 
+apply from: 'gradle/minecraft-versions.gradle'
+
 version = project.mod_version
 group = project.maven_group
 
 base {
-    archivesName = project.archives_base_name
+    archivesName = "${project.archives_base_name}-mc${project.minecraft_version}"
 }
 
 repositories {
@@ -173,10 +175,6 @@ jar {
 
 jar {
     dependsOn(dummySodiumProviderGenerator)
-}
-
-loom {
-    accessWidenerPath = file("src/main/resources/voxy.accesswidener")
 }
 
 def runtimeOnlyMsk = {arg->}
@@ -370,12 +368,16 @@ jar {
     }
 }
 
-project.ext.lwjglVersion = "3.4.3"
-
-// --- Voxy Vulkan backend deps (provided by Minecraft 26.3 runtime; do not bundle to avoid JiJ classpath conflicts) ---
+// --- Voxy Vulkan backend deps (optional at runtime; probed via capability detection) ---
 dependencies {
-    compileOnly("org.lwjgl:lwjgl-vulkan:${project.ext.lwjglVersion}")
-    compileOnly("org.lwjgl:lwjgl-shaderc:${project.ext.lwjglVersion}")
+    include(implementation("org.lwjgl:lwjgl-vulkan:${project.ext.lwjglVersion}"))
+    include(implementation("org.lwjgl:lwjgl-shaderc:${project.ext.lwjglVersion}"))
+    for (n in ["natives-windows", "natives-linux", "natives-macos", "natives-macos-arm64"]) {
+        include(runtimeOnly("org.lwjgl:lwjgl-shaderc:${project.ext.lwjglVersion}:${n}"))
+    }
+    // MoltenVK translation layer path on macOS is provided by lwjgl-vulkan natives there:
+    include(runtimeOnly("org.lwjgl:lwjgl-vulkan:${project.ext.lwjglVersion}:natives-macos"))
+    include(runtimeOnly("org.lwjgl:lwjgl-vulkan:${project.ext.lwjglVersion}:natives-macos-arm64"))
 }
 project.ext.lwjglNatives = "natives-windows"
 
@@ -386,15 +388,10 @@ repositories {
 
 dependencies {
     implementation platform("org.lwjgl:lwjgl-bom:$lwjglVersion")
-    if (findProject("lwjgl_use_unsafe")?:false) {
-        implementation "org.lwjgl:lwjgl:unsafe"
-        include(implementation "org.lwjgl:lwjgl-lmdb:unsafe")
-        include(implementation "org.lwjgl:lwjgl-zstd:unsafe")
-    } else {
-        implementation "org.lwjgl:lwjgl"
-        include(implementation "org.lwjgl:lwjgl-lmdb")
-        include(implementation "org.lwjgl:lwjgl-zstd")
-    }
+
+    implementation "org.lwjgl:lwjgl:unsafe"
+    include(implementation "org.lwjgl:lwjgl-lmdb:unsafe")
+    include(implementation "org.lwjgl:lwjgl-zstd:unsafe")
     runtimeOnly "org.lwjgl:lwjgl:$lwjglVersion:natives-windows"
     runtimeOnly "org.lwjgl:lwjgl:$lwjglVersion:natives-linux"
     include(runtimeOnly "org.lwjgl:lwjgl-lmdb:$lwjglVersion:natives-windows")
@@ -449,6 +446,8 @@ tasks.register('verifyBlaze3dBackendIsolation') {
                 'org.lwjgl.vulkan',
                 'com.mojang.blaze3d.opengl',
                 'com.mojang.blaze3d.vulkan',
+                'com.mojang.renderpearl.backend.opengl',
+                'com.mojang.renderpearl.backend.vulkan',
                 'me.cortex.voxy.client.core.gl',
                 'me.cortex.voxy.client.core.vk'
         ]
@@ -482,7 +481,8 @@ sourceSets {
     blaze3dStreamingTest {
         java {
             srcDirs = ['src/main/java', 'src/streamingTest/java']
-            include '**/Blaze3dLodStreaming.java', '**/Blaze3dLodStreamingTest.java',
+            include '**/FogRangePolicy.java', '**/FogRangePolicyTest.java',
+                    '**/Blaze3dLodStreaming.java', '**/Blaze3dLodStreamingTest.java',
                     '**/Blaze3dQuadEncoder.java', '**/Blaze3dQuadEncoderTest.java',
                     '**/Blaze3dModelEncoder.java', '**/Blaze3dModelEncoderTest.java',
                     '**/Blaze3dDiscardPolicy.java', '**/Blaze3dDiscardPolicyTest.java',
@@ -495,6 +495,8 @@ sourceSets {
         }
     }
 }
+
+configureMinecraftPipelineTests()
 
 tasks.register('verifyBlaze3dLodStreaming', JavaExec) {
     group = 'verification'
@@ -510,6 +512,7 @@ tasks.register('verifyBlaze3dLodStreaming', JavaExec) {
 tasks.named('check') {
     dependsOn tasks.named('verifyBlaze3dBackendIsolation')
     dependsOn tasks.named('verifyBlaze3dLodStreaming')
+    dependsOn tasks.named('verifyFogRanges')
     dependsOn tasks.named('verifyBlaze3dPipelineTargets')
 }
 
@@ -526,7 +529,7 @@ tasks.register('verifyBlaze3dPipelineTargets', JavaExec) {
 
 jmh {
     zip64 = true
-    includes=["SaveLoadJMH"]
+    includes = ["SaveLoadJMH"]
     //profilers = ["xperfasm"]
 }
 
@@ -544,3 +547,14 @@ if (!isInGHA) {
         }
     }
 }*/
+
+// Shared fog ownership must preserve the horizon and fall back when rendering fails.
+tasks.register('verifyFogRanges', JavaExec) {
+    group = 'verification'
+    dependsOn tasks.named('blaze3dStreamingTestClasses')
+    classpath = sourceSets.blaze3dStreamingTest.output
+    mainClass = 'me.cortex.voxy.client.core.FogRangePolicyTest'
+    javaLauncher = javaToolchains.launcherFor {
+        languageVersion = JavaLanguageVersion.of(targetJavaVersion)
+    }
+}

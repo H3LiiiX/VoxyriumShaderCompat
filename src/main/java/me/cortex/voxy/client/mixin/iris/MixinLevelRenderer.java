@@ -1,7 +1,12 @@
 package me.cortex.voxy.client.mixin.iris;
 
+//? if MC_26_2
+import com.mojang.blaze3d.buffers.GpuBufferSlice;
+//? endif
 import com.mojang.blaze3d.resource.GraphicsResourceAllocator;
+//? if MC_26_3
 import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
+//? endif
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.client.core.util.IrisUtil;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
@@ -30,7 +35,11 @@ public class MixinLevelRenderer {
     private GameRenderer gameRenderer;
 
     @Inject(method = "render", at = @At("HEAD"), order = 100)
+//? if MC_26_3
     private void voxy$injectIrisCompat(GraphicsResourceAllocator resourceAllocator, boolean renderOutline, CameraRenderState cameraState, GpuBufferSlice terrainFog, Vector4f fogColor, boolean shouldRenderSky, boolean consistentDepthRequired, CallbackInfo ci) {
+//? else
+    private void voxy$injectIrisCompat(GraphicsResourceAllocator resourceAllocator, DeltaTracker deltaTracker, boolean renderOutline, CameraRenderState cameraState, Matrix4fc modelViewMatrix, GpuBufferSlice terrainFog, Vector4f fogColor, boolean shouldRenderSky, CallbackInfo ci) {
+//? endif
         if (IrisUtil.irisShaderPackEnabled()) {
             var renderer = IVoxyRenderSystemHolder.getNullableHolder();
             if (renderer != null) {

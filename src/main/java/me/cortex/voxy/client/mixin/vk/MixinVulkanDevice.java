@@ -1,6 +1,10 @@
 package me.cortex.voxy.client.mixin.vk;
 
+//? if MC_26_3
 import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
+//? else
+import com.mojang.blaze3d.vulkan.VulkanDevice;
+//? endif
 import me.cortex.voxy.client.core.vk.MinecraftVkHost;
 import me.cortex.voxy.client.core.vk.MinecraftVkHostAdapter;
 import me.cortex.voxy.common.Logger;

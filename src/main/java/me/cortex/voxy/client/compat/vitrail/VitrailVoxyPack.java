@@ -1,6 +1,12 @@
 package me.cortex.voxy.client.compat.vitrail;
 
+//? if MC_26_3
+import com.mojang.renderpearl.api.textures.GpuSampler;
 import com.mojang.renderpearl.api.textures.GpuTextureView;
+//? else
+import com.mojang.blaze3d.textures.GpuSampler;
+import com.mojang.blaze3d.textures.GpuTextureView;
+//? endif
 import me.cortex.voxy.common.Logger;
 import net.fabricmc.loader.api.FabricLoader;
 import org.joml.Matrix3fc;
@@ -610,7 +616,7 @@ public final class VitrailVoxyPack {
 
     //The sampler the pack's own terrain reads the block atlas through (nearest, blended mips, the
     // player's anisotropy), or null outside Vitrail
-    public static com.mojang.renderpearl.api.textures.GpuSampler terrainSampler() {
+    public static GpuSampler terrainSampler() {
         if (!terrainSamplerReflected) {
             terrainSamplerReflected = true;
             try {
@@ -621,7 +627,7 @@ public final class VitrailVoxyPack {
         }
         if (terrainSamplerGet == null) return null;
         try {
-            return (com.mojang.renderpearl.api.textures.GpuSampler) terrainSamplerGet.invoke(null);
+            return (GpuSampler) terrainSamplerGet.invoke(null);
         } catch (Throwable t) {
             return null;
         }

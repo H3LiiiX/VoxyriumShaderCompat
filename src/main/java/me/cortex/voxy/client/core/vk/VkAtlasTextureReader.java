@@ -1,7 +1,12 @@
 package me.cortex.voxy.client.core.vk;
 
+//? if MC_26_3
 import com.mojang.renderpearl.api.textures.GpuTexture;
 import com.mojang.renderpearl.backend.vulkan.VulkanGpuTexture;
+//? else
+import com.mojang.blaze3d.textures.GpuTexture;
+import com.mojang.blaze3d.vulkan.VulkanGpuTexture;
+//? endif
 import me.cortex.voxy.client.core.model.bakery.IAtlasTextureReader;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;

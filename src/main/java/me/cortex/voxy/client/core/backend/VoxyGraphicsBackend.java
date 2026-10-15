@@ -1,6 +1,10 @@
 package me.cortex.voxy.client.core.backend;
 
+//? if MC_26_3
 import com.mojang.renderpearl.api.device.GpuDevice;
+//? else
+import com.mojang.blaze3d.systems.GpuDevice;
+//? endif
 
 import java.util.Locale;
 

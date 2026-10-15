@@ -1,15 +1,28 @@
 #version 330
+//? if MC_26_3
+#extension GL_ARB_separate_shader_objects : require
+//? endif
 layout(std140) uniform DynamicTransforms {
     mat4 ModelViewMat; // Complete world-to-clip matrix, including camera translation.
+//? if MC_26_3
+    mat4 TextureMat;
+//? endif
     vec4 ColorModulator;
     vec3 ModelOffset; // source viewport width/height, zero-to-one depth
+//? if MC_26_2
     mat4 TextureMat;
+//? endif
 };
 uniform sampler2D Sampler0;
 uniform samplerBuffer VoxyOcclusionOrigins;
 uniform usamplerBuffer VoxyOcclusionBounds;
+//? if MC_26_3
+layout(location = 0) in vec2 texCoord;
+layout(location = 0) out vec4 fragColor;
+//? else
 in vec2 texCoord;
 out vec4 fragColor;
+//? endif
 
 bool visible(vec4 origin, uint bounds) {
     vec3 minimum = vec3(bounds & 31u, (bounds >> 5u) & 31u, (bounds >> 10u) & 31u);

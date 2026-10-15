@@ -1,12 +1,23 @@
 #version 330
+//? if MC_26_3
+#extension GL_ARB_separate_shader_objects : require
+#include <voxy:blaze3d_fragment_discard.glsl>
+#include <voxy:blaze3d_sodium_coverage.glsl>
+//? else
 #moj_import <voxy:blaze3d_fragment_discard.glsl>
 #moj_import <voxy:blaze3d_sodium_coverage.glsl>
+//? endif
 
 layout(std140) uniform DynamicTransforms {
     mat4 ModelViewMat;
+//? if MC_26_3
+    mat4 TextureMat;
+//? endif
     vec4 ColorModulator;
     vec3 ModelOffset;
+//? if MC_26_2
     mat4 TextureMat;
+//? endif
 };
 layout(std140) uniform Fog {
     vec4 FogColor;
@@ -20,6 +31,15 @@ layout(std140) uniform Fog {
 
 uniform sampler2D Sampler0;
 
+//? if MC_26_3
+layout(location = 0) in vec2 texCoord0;
+layout(location = 1) flat in vec4 tintColor;
+layout(location = 2) flat in vec4 vertexLighting;
+layout(location = 3) flat in int modelId;
+layout(location = 4) flat in int quadFlags;
+layout(location = 5) in float sphericalDistance;
+layout(location = 6) in vec2 worldXZ;
+//? else
 in vec2 texCoord0;
 flat in vec4 tintColor;
 flat in vec4 vertexLighting;
@@ -27,8 +47,13 @@ flat in int modelId;
 flat in int quadFlags;
 in float sphericalDistance;
 in vec2 worldXZ;
+//? endif
 
+//? if MC_26_3
+layout(location = 0) out vec4 fragColor;
+//? else
 out vec4 fragColor;
+//? endif
 
 float linearFogValue(float fogDistance, float start, float end) {
     if (fogDistance <= start) {
@@ -84,10 +109,12 @@ void main() {
         color *= tintColor;
     }
     color *= vertexLighting;
-    // Render-distance fog is deliberately disabled for both Sodium and Voxy and applied once
-    // from their combined depth. Environmental fog stays per geometry, matching Sodium.
-    float fogValue = linearFogValue(
+    // Match the 1.21.11 compositor: fog Voxy LoDs only, leaving the shared Minecraft scene intact.
+    float environmentalFog = linearFogValue(
             sphericalDistance, FogEnvironmentalStart, FogEnvironmentalEnd);
+    float renderDistanceFog = ModelOffset.z > ModelOffset.y
+            ? linearFogValue(sphericalDistance, ModelOffset.y, ModelOffset.z) : 0.0;
+    float fogValue = max(environmentalFog, renderDistanceFog);
     color.rgb = mix(color.rgb, FogColor.rgb, fogValue * FogColor.a);
     fragColor = color * ColorModulator;
 }

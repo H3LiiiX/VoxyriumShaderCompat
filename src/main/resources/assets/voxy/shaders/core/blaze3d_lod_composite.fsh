@@ -1,16 +1,27 @@
 #version 330
+//? if MC_26_3
+#extension GL_ARB_separate_shader_objects : require
+#include <voxy:blaze3d_fragment_discard.glsl>
+//? else
 #moj_import <voxy:blaze3d_fragment_discard.glsl>
+//? endif
 
 layout(std140) uniform DynamicTransforms {
     // The Java side stores the inverse Voxy projection here for reconstruction.
     mat4 ModelViewMat;
+//? if MC_26_3
+    // Minecraft/Sodium projection used to produce the destination depth.
+    mat4 TextureMat;
+//? endif
     // xyz: world up expressed in view space; w: opacity multiplier.
     vec4 ColorModulator;
     // x is 1 when NDC depth already uses Vulkan's zero-to-one range; yz contain
     // the start/end distances of the Sodium-to-Voxy transition in blocks.
     vec3 ModelOffset;
+//? if MC_26_2
     // Minecraft/Sodium projection used to produce the destination depth.
     mat4 TextureMat;
+//? endif
 };
 
 uniform sampler2D Sampler0;
@@ -18,9 +29,17 @@ uniform sampler2D Sampler1;
 // Snapshot of Sodium's solid/cutout depth, taken before Voxy composites into the target.
 uniform sampler2D Sampler2;
 
+//? if MC_26_3
+layout(location = 0) in vec2 texCoord;
+//? else
 in vec2 texCoord;
+//? endif
 
+//? if MC_26_3
+layout(location = 0) out vec4 fragColor;
+//? else
 out vec4 fragColor;
+//? endif
 
 void main() {
     VOXY_INIT_FRAGMENT();

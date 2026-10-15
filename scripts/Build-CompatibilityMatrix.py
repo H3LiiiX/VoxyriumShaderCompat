@@ -32,12 +32,13 @@ else:
     import tty
 
 USER_AGENT = "vistaero-Voxyrium-compatibility-script/1.0"
-# mc_1.21-1.21.11 is the source baseline. Each Minecraft target below is a
+# dev and mc_1.21-1.21.11 each have a shared source baseline. Each target is a
 # separate Gradle invocation so build.gradle can select its conditional source
 # snapshot and dependencies through -Pminecraft_version.
 MATRIX = [
-    {"branch": "mc_26.3", "expected": "26.3", "versions": ["26.3"], "tasks": []},
-    {"branch": "dev", "expected": "26.2", "versions": ["26.2"], "tasks": []},
+    *[{"branch": "dev", "expected": "26.2", "build_version": version,
+       "java": 25, "key": f"dev__{version}", "versions": [version], "tasks": []}
+      for version in ["26.3", "26.2"]],
     {"branch": "mc_26.1", "expected": "26.1.2", "versions": ["26.1.2"], "tasks": []},
     {"branch": "mc_26.1.1", "expected": "26.1.1", "versions": ["26.1.1"], "tasks": []},
     *[{"branch": "mc_1.21-1.21.11", "expected": "1.21.11", "build_version": version,
@@ -55,6 +56,7 @@ MATRIX = [
 # the runtime updater silently replace that ABI with a newer release merely
 # because Modrinth marks it as covering a neighbouring Minecraft version.
 VOXY_RUNTIME_CONSTRAINTS = {
+    "26.3": {"iris": "=1.11.7+26.3-fabric", "sodium": "=mc26.3-0.9.2-fabric"},
     "1.21": {"iris": "=1.8.8+1.21.1-fabric", "sodium": "=mc1.21.1-0.6.13-fabric"},
     "1.21.1": {"iris": "=1.8.14-beta.1+1.21.1-fabric", "sodium": "=mc1.21.1-0.8.13-fabric"},
     "1.21.2": {"iris": "=1.8.0-beta.6+1.21.2-fabric", "sodium": "=mc1.21.2-0.6.0-beta.3-fabric"},
@@ -420,11 +422,14 @@ def target_java_version(build_file, branch):
     return int(match.group(1))
 
 
-def built_jar(worktree):
-    jars = sorted((jar for jar in (worktree / "build/libs").glob("*.jar") if not re.search(r"(sources|javadoc|dev|dummyprovider)", jar.name, re.I)), key=lambda item: item.stat().st_size, reverse=True)
+def built_jar(worktree, minecraft_version=None):
+    directory = worktree / f"build/minecraft-{minecraft_version}/libs"
+    if minecraft_version is None or not directory.is_dir():
+        directory = worktree / "build/libs"
+    jars = sorted((jar for jar in directory.glob("*.jar") if not re.search(r"(sources|javadoc|dev|dummyprovider)", jar.name, re.I)), key=lambda item: item.stat().st_size, reverse=True)
     if len(jars) != 1:
         names = ", ".join(jar.name for jar in jars)
-        fail(f"Expected exactly one distributable mod JAR in '{worktree / 'build/libs'}'; found {len(jars)}: {names}")
+        fail(f"Expected exactly one distributable mod JAR in '{directory}'; found {len(jars)}: {names}")
     return jars[0]
 
 
@@ -783,7 +788,7 @@ def build_single_build_worker(payload):
             run(arguments + ["build"], cwd=worktree, env=environment, log=log_path, live_console=True)
         else:
             run(arguments + ["clean", "build"], cwd=worktree, env=environment, log=log_path, live_console=True)
-        jar = built_jar(worktree)
+        jar = built_jar(worktree, build_version)
         if jar_mod_id(jar) != "voxy":
             fail(f"Built artifact '{jar.name}' contains mod id '{jar_mod_id(jar)}', not 'voxy'.")
         commit = output(["git", "-C", str(worktree), "rev-parse", "--short=8", "HEAD"])

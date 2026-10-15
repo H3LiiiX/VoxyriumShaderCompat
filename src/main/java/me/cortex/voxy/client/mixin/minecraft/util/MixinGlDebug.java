@@ -2,7 +2,11 @@ package me.cortex.voxy.client.mixin.minecraft.util;
 
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+//? if MC_26_3
 import com.mojang.renderpearl.backend.opengl.GlDebug;
+//? else
+import com.mojang.blaze3d.opengl.GlDebug;
+//? endif
 import me.cortex.voxy.client.core.gl.Capabilities;
 import org.slf4j.Logger;
 import org.spongepowered.asm.mixin.Mixin;
