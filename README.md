@@ -1,6 +1,6 @@
 # Voxyrium with support for Vitrail Shaders
 
-A fork of Voxy with support for Vitrail Shaders and native OpenGL/Vulkan and experimental Blaze3D rendering. Select the renderer from Voxy's Rendering settings.
+A fork of Voxy with support for Vitrail Shaders and native OpenGL/Vulkan rendering. There is currently no shader support for the experimental Blaze3D renderer.
 
 ## Changes
 
